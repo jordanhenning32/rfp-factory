@@ -1,0 +1,86 @@
+{
+  "_meta": {
+    "version": "1.0.0-sample",
+    "rates_effective_date": "2026-01-01",
+    "last_updated": "2026-01-01",
+    "schedule": "Sample GSA OLM (Order-Level Materials)",
+    "naics": "541511",
+    "naics_description": "Custom Computer Programming Services",
+    "max_order_usd": 500000,
+    "min_order_usd": 100,
+    "geographic_coverage": "48 Continental United States",
+    "description": "ILLUSTRATIVE SAMPLE internal pricing rules for a fictional company. All rates, wage bands, burden components, overhead, and margins are invented for demonstration. Copy to data/internal_pricing_rules.json and replace with your own confidential cost model to run the system. Real cost data should NEVER be committed to version control.",
+    "_usage_notes_for_agents": {
+      "rates_are_ceilings": "labor_catalog ceiling rates are the approved CEILING, not a commitment. Bid rate must be <= ceiling.",
+      "h_m_l_methodology": "For each bid, produce three risk-adjusted price points (Low/Medium/High) from the same labor estimate with different burden/margin/contingency assumptions.",
+      "ga_treatment": "Office overhead is a SEPARATE G&A pool — do not fold into the per-FTE wrap rate.",
+      "wage_band_extrapolation": "Bands marked validated=false are extrapolated; flag them in review output."
+    }
+  },
+  "labor_catalog": [
+    { "category": "Program Manager", "ceiling_hourly_rate_usd": 185.00, "min_experience_years": 10, "education": "Bachelor's", "default_wage_band": "150k" },
+    { "category": "Senior Software Engineer", "ceiling_hourly_rate_usd": 165.00, "min_experience_years": 7, "education": "Bachelor's", "default_wage_band": "135k" },
+    { "category": "Software Engineer", "ceiling_hourly_rate_usd": 130.00, "min_experience_years": 3, "education": "Bachelor's", "default_wage_band": "105k" },
+    { "category": "Business Analyst", "ceiling_hourly_rate_usd": 120.00, "min_experience_years": 3, "education": "Bachelor's", "default_wage_band": "95k" }
+  ],
+  "_education_substitution_rule": "Sample rule: 4 additional years of experience may substitute for a bachelor's degree.",
+  "annual_billable_hours": 1860,
+  "_annual_hours_breakdown": {
+    "calendar_hours": 2080,
+    "pto_days": 15,
+    "holidays": 11,
+    "billable_hours": 1860,
+    "note": "Sample billable-hours assumption."
+  },
+  "default_annual_labor_escalation_rate": 0.03,
+  "_labor_escalation_note": "Sample 3% annual escalation applied to option years.",
+  "_multi_year_pricing_default": "Escalate base labor by default_annual_labor_escalation_rate per option year unless the RFP specifies otherwise.",
+  "wage_bands": {
+    "95k": { "annual_base_wage_usd": 95000, "loaded_annual_cost_high_coverage_usd": 138000, "loaded_annual_cost_low_coverage_usd": 129000, "validated": false, "extrapolation_method": "wrap_rate_formula (sample)" },
+    "105k": { "annual_base_wage_usd": 105000, "loaded_annual_cost_high_coverage_usd": 151000, "loaded_annual_cost_low_coverage_usd": 141000, "validated": true, "source": "sample validated bid" },
+    "135k": { "annual_base_wage_usd": 135000, "loaded_annual_cost_high_coverage_usd": 190000, "loaded_annual_cost_low_coverage_usd": 178000, "validated": true, "source": "sample validated bid" },
+    "150k": { "annual_base_wage_usd": 150000, "loaded_annual_cost_high_coverage_usd": 209000, "loaded_annual_cost_low_coverage_usd": 196000, "validated": false, "extrapolation_method": "wrap_rate_formula (sample)" }
+  },
+  "wrap_rate_formula": {
+    "_description": "SAMPLE wrap-rate model. Numbers are invented placeholders.",
+    "components": {
+      "fica_rate": 0.062,
+      "fica_wage_base_2025_usd": 168600,
+      "medicare_rate": 0.0145,
+      "futa_annual_usd": 42.00,
+      "suta_rate": 0.03,
+      "bonus_rate_of_wage": 0.05,
+      "employer_401k_match_rate_of_wage": 0.04,
+      "fixed_other_benefits_usd": 3000.00,
+      "health_high_coverage_usd": 18000.00,
+      "health_low_coverage_usd": 9000.00,
+      "payroll_platform_overhead_usd": 1200.00,
+      "software_overhead_usd": 2400.00
+    },
+    "formula_pseudocode_python": "loaded = base_wage*(1+fica+medicare+suta+bonus+match) + fixed_other_benefits + health + payroll_platform_overhead + software_overhead (sample)",
+    "validation": "Sample formula — validate against a real bid before use."
+  },
+  "ga_overhead": {
+    "annual_office_pool_usd": 60000,
+    "monthly_pool_usd": 5000,
+    "components_monthly_usd": { "rent": 2500, "utilities": 600, "internet": 300, "supplies": 400, "misc": 1200 },
+    "allocation_method": "Divide annual G&A pool by (avg_headcount_during_pop * annual_billable_hours) to get a per-hour add-on.",
+    "allocation_formula": "ga_hourly = annual_office_pool_usd / (avg_headcount_during_pop * annual_billable_hours)",
+    "_allocation_notes": ["Sample allocation. avg_headcount_during_pop is company-wide, not just project FTEs."]
+  },
+  "scenario_definitions": {
+    "_methodology": "Same labor estimate, three burden/margin/contingency profiles.",
+    "low": { "label": "Low (Competitive)", "description": "Aggressive/competitive pricing.", "coverage_level": "low", "profit_margin_pct": 0.08, "contingency_hours_pct": 0.03, "use_when": "Price-sensitive, high-competition procurements." },
+    "medium": { "label": "Medium (Target)", "description": "Balanced target pricing.", "coverage_level": "high", "profit_margin_pct": 0.12, "contingency_hours_pct": 0.05, "use_when": "Default." },
+    "high": { "label": "High (Protective)", "description": "Risk-protective pricing.", "coverage_level": "high", "profit_margin_pct": 0.15, "contingency_hours_pct": 0.08, "use_when": "High-risk or ambiguous scope." },
+    "_per_scenario_output_required": ["labor cost", "wrap", "G&A add-on", "contingency", "margin", "total price", "effective rate", "assumptions"]
+  },
+  "profit_policy": {
+    "floor_margin_pct": 0.08,
+    "target_margin_pct": 0.12,
+    "ceiling_margin_pct": 0.15,
+    "rationale": "Sample margin policy.",
+    "below_floor_action": "Flag for human review before submission.",
+    "above_ceiling_action": "Flag as potentially non-competitive."
+  }
+}

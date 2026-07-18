@@ -1,0 +1,80 @@
+{
+  "_meta": {
+    "version": "1.0.0-sample",
+    "effective_from": "2026-01-01",
+    "service_line": "payment_systems",
+    "description": "ILLUSTRATIVE SAMPLE fee schedule + capability data for a fictional payment-processing service line. Replaces the labor catalog when the Cost Writer drafts cost narratives for payment-processing RFPs. All rates and attestations here are invented. Copy to data/pricing/payment_systems.json and replace with your own data to run the system.",
+    "_usage_notes_for_agents": {
+      "rate_model_caveat": "Standard model here is revenue-share. When an RFP asks for interchange-plus or flat-rate, propose an alternative from volume_adjusted_offering and flag the change.",
+      "pci_level_disclosure": "Always disclose the current PCI level honestly and present the roadmap; never overstate.",
+      "hardware_strategy": "If in-house hardware is not maintained, surface a subcontractor/partner arrangement; partner identity is [NEEDS_HUMAN].",
+      "fee_units_explanation": "Percentages are decimals (0.0300 = 3.00%); render as `3.00%` in narrative."
+    }
+  },
+  "pricing_models_supported": [
+    { "model": "percentage_of_collected", "description": "A percentage of every successfully collected payment.", "best_for": ["recurring billing", "membership dues", "donations"], "weak_for": ["high-ticket one-time", "county POS flat-rate expectations"] },
+    { "model": "interchange_plus", "description": "Interchange cost plus a fixed markup.", "best_for": ["government POS", "transparency-required procurements"], "weak_for": ["very low volume"] },
+    { "model": "flat_rate", "description": "Single blended rate per transaction.", "best_for": ["simple/small merchants"], "weak_for": ["large volume optimization"] }
+  ],
+  "standard_fee_schedule": {
+    "_source": "Sample rate sheet.",
+    "payment_collection_rates_pct": { "ach_processing": 0.0100, "credit_card_processing": 0.0300, "check_or_money_order_collection": 0.0150, "bad_debt_collection": 0.2000, "_bad_debt_note": "Sample contingency rate." },
+    "minimum_per_item_usd": 0.50,
+    "service_fees": { "declined_credit_card_processing_per_attempt_usd": 0.25, "management_system_per_month_usd": 100.00, "ach_remittance_per_remittance_usd": 5.00 },
+    "optional_services": [ { "name": "Online portal", "rate": "$50/month (sample)" }, { "name": "Digital signature", "rate": "$0.10/document (sample)" } ],
+    "enrollment_fee_usd": 0.00,
+    "monthly_maintenance_fee_usd": 25.00,
+    "cancellation_fee_usd": 0.00,
+    "_no_lockin_note": "Sample: no long-term lock-in."
+  },
+  "volume_adjusted_offering": {
+    "_description": "Fallback structure for procurements that want interchange-plus/flat-rate.",
+    "preferred_model": "interchange_plus",
+    "pricing_strategy": "Build a county-tier structure off the ranges below.",
+    "typical_county_tier_ranges_for_fallback": {
+      "_purpose": "Sample negotiating ranges.",
+      "credit_card_markup_basis_points_range": [10, 40],
+      "credit_card_per_transaction_fee_usd_range": [0.05, 0.15],
+      "ach_per_transaction_fee_usd_range": [0.10, 0.30],
+      "monthly_account_fee_usd_range": [0, 25]
+    },
+    "early_termination_fee_usd": 0.00,
+    "_writer_guidance": "Disclose that standard rates are volume-dependent and may be restructured."
+  },
+  "hardware_options": {
+    "_status": "no in-house terminal hardware (sample)",
+    "approach": "subcontractor / hardware partner",
+    "qualified_partner_brands": ["Sample Brand A", "Sample Brand B"],
+    "partner_selection_strategy": "Select per RFP volume + terminal requirements.",
+    "terminal_models_offered": "Via partner (sample).",
+    "_writer_guidance": "Never claim in-house hardware; name partner only after [NEEDS_HUMAN] confirmation."
+  },
+  "compliance_attestations": {
+    "pci_dss_level": 3,
+    "pci_dss_target_level": 2,
+    "pci_dss_target_attainment_within_months": 12,
+    "pci_dss_disclosure_guidance": "Disclose current level honestly and present the roadmap.",
+    "tokenization_supported": true,
+    "emv_certified": true,
+    "encryption_end_to_end": true,
+    "data_residency": "US (sample)"
+  },
+  "our_cost_basis": {
+    "_purpose": "Sample internal cost basis for margin math. Never disclosed in proposals.",
+    "_default_disclosure": "internal-only",
+    "sponsor_acquirer_fee_bps": 15,
+    "gateway_per_txn_usd": 0.05,
+    "annualized_pci_compliance_usd": 10000.00,
+    "annualized_support_allocation_usd": 20000.00
+  },
+  "merchant_account_capabilities": {
+    "card_brands_processed": ["Visa", "Mastercard", "Amex", "Discover"],
+    "ach_eft_processing": true,
+    "recurring_billing": true,
+    "online_signup_and_payment_portals": true,
+    "real_time_reporting_dashboard": true,
+    "automatic_retry_of_declined_transactions": true,
+    "claimed_failed_payment_recovery_rate_pct": 0.50,
+    "_recovery_rate_caveat": "Sample claim; must be substantiated before use in a proposal."
+  }
+}

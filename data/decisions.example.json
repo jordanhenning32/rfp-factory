@@ -1,0 +1,13 @@
+{
+  "_meta": {
+    "version": "1.0.0-sample",
+    "description": "ILLUSTRATIVE SAMPLE cross-RFP memory of gap resolutions. Each entry captures a decision about how to handle a recurring kind of gap, so future analyses inherit established practice. The Shortfall Strategist reads this on every run. Copy to data/decisions.json to run the system; the real file accumulates your own decisions and should stay local."
+  },
+  "decisions": [
+    {
+      "gap_pattern": "Sample: RFP requires a certification we do not hold",
+      "decision": "Default to teaming with a partner that holds it; flag [NEEDS_HUMAN] to confirm partner.",
+      "added_at": "2026-01-01"
+    }
+  ]
+}

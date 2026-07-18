@@ -1,0 +1,104 @@
+{
+  "_meta": {
+    "version": "1.0.0-sample",
+    "effective_from": "2026-01-01",
+    "design_doc_reference": "RFP_System_Architecture.md",
+    "description": "ILLUSTRATIVE SAMPLE profile for a fictional company (Acme Federal Solutions LLC). This template shows the shape of the canonical company profile that is loaded into every agent's context at runtime. Copy this file to data/company_profile.json and replace with your own data to run the system. All values here are invented for demonstration."
+  },
+  "company": {
+    "legal_name": "Acme Federal Solutions LLC",
+    "uei": "SAMPLE0UEI000",
+    "cage_code": "0XXXX",
+    "duns": "000000000",
+    "state_vendor_id": "000000",
+    "sam_registered": true,
+    "business_size": "small",
+    "status_positioning": "public-sector-only",
+    "headquarters": {
+      "registered_address": "1 Example Way, Anytown, USA",
+      "physical_office": "1 Example Way, Anytown, USA",
+      "_canonical_address_note": "Agents must render ONE address line per occurrence."
+    },
+    "website": "https://example.com/",
+    "open_source_program": "https://github.com/example"
+  },
+  "naics": {
+    "primary": ["541511 — Custom Computer Programming Services"],
+    "secondary": ["541512 — Computer Systems Design", "541519 — Other Computer Related Services"],
+    "opportunistic": ["518210", "541611", "611420"]
+  },
+  "certifications": ["SDVOSB", "Small Business", "ISO 9001 (sample)", "CMMI-DEV L3 (sample)"],
+  "potential_future_certifications": ["8(a) (sample target)"],
+  "contract_vehicles": ["GSA MAS (sample)", "Agency BPA (sample)", "Open market"],
+  "target_geography": {
+    "primary": ["Continental United States (remote-first)"],
+    "self_declared_targets": ["Federal civilian", "State IT", "Health IT", "Modernization"],
+    "bid_history": ["Sample agency A", "Sample agency B"],
+    "in_scope_additional": ["Cloud migration", "Data platform", "AI/ML enablement"]
+  },
+  "capability_areas": [
+    {
+      "area": "Application Modernization",
+      "tech": ["Python", "TypeScript", "React", "PostgreSQL", "AWS", "Kubernetes"],
+      "strengths": ["Legacy re-platforming", "API-first design", "CI/CD", "Accessibility (508)", "Cloud-native"]
+    },
+    {
+      "area": "Data & AI",
+      "tech": ["Python", "LLM orchestration", "RAG", "dbt", "Snowflake"],
+      "strengths": ["Applied LLM systems", "Document automation", "Analytics", "MLOps", "Human-in-the-loop review"]
+    }
+  ],
+  "deep_specializations": ["Sample specialization 1", "Sample specialization 2", "Sample specialization 3"],
+  "key_personnel": [
+    {
+      "name": "Jane Doe",
+      "role": "Program Manager",
+      "focus": "Delivery leadership for federal IT programs",
+      "years_experience": 15,
+      "past_performance": ["Sample program A", "Sample program B", "Sample program C"]
+    },
+    {
+      "name": "John Roe",
+      "role": "Lead Engineer",
+      "focus": "Cloud-native application modernization",
+      "years_experience": 12,
+      "past_performance": ["Sample program A", "Sample program D"]
+    }
+  ],
+  "labor_rate_card": {
+    "description": "SAMPLE published ceiling rates for demonstration only.",
+    "effective_date": "2026-01-01",
+    "max_order_usd": 500000,
+    "min_order_usd": 100,
+    "geographic_coverage": "48 Continental United States",
+    "payment_terms": "Net 30",
+    "education_substitution_rule": "Additional experience may substitute for degree per category notes.",
+    "categories": [
+      { "title": "Program Manager", "hourly_rate_usd": 185.00, "min_years": 10 },
+      { "title": "Senior Software Engineer", "hourly_rate_usd": 165.00, "min_years": 7 },
+      { "title": "Software Engineer", "hourly_rate_usd": 130.00, "min_years": 3 },
+      { "title": "Business Analyst", "hourly_rate_usd": 120.00, "min_years": 3 }
+    ],
+    "notes": "Sample rates. Bid rate must be <= ceiling."
+  },
+  "past_performance": [
+    {
+      "project": "Sample Modernization Project",
+      "customer": "Sample Federal Agency",
+      "role": "Prime",
+      "status": "won",
+      "scope": "Re-platformed a legacy case-management system to a cloud-native stack.",
+      "tags": ["modernization", "cloud", "python", "react", "508"],
+      "citation_class": "past_performance_won"
+    }
+  ],
+  "ideal_opportunity_signals": ["Modernization", "Cloud-native", "Agile/DevSecOps", "Applied AI", "Remote-friendly"],
+  "exclusion_signals": ["Hardware manufacturing", "On-site-only clearance work beyond scope", "Non-IT scope"],
+  "differentiators_for_proposals": ["Senior-heavy delivery teams", "Human-in-the-loop AI", "Accessibility-first", "Fixed-price discipline"],
+  "_usage_notes_for_agents": {
+    "citation_legitimacy": "Only cite work in past_performance with citation_class past_performance_won/subbed.",
+    "size_grounding": "Ground all claims in this profile; never invent staff, certs, or past performance.",
+    "shortfall_honesty": "When the profile lacks a capability, surface it as a gap — do not fabricate coverage.",
+    "address_canonical": "Use one canonical address per occurrence."
+  }
+}

@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment / secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Data — local artifacts, never committed
+data/sqlite.db*
+data/kb_documents/*
+data/rfp_packages/*
+data/outputs/*
+data/backups/*
+data/debug/*
+!data/kb_documents/.gitkeep
+!data/rfp_packages/.gitkeep
+!data/outputs/.gitkeep
+!data/backups/.gitkeep
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Sentry
+.sentryclirc
+
+# Multi-agent pipeline orchestrator scratch — plan.md / todo.md /
+# bug_report*.md / audit artifacts that get rewritten every run.
+# These belong in the runtime workspace, not in version control.
+.pipeline/
+tasks/
+
+# Confidential business data — real files stay LOCAL, never committed.
+# Copy the tracked *.example.json templates to these names to run the app.
+data/company_profile.json
+data/internal_pricing_rules.json
+data/teaming_partners.json
+data/decisions.json
+data/pricing/*.json
+!data/pricing/*.example.json
+
+# Internal working handoff docs — kept locally, not part of the public repo.
+docs/HANDOFF*.md
+
+# Redundant generated architecture doc + its build script.
+# docs/RFP_System_Architecture.md is the source of truth.
+docs/RFP_System_Architecture.docx
+docs/_build_architecture_docx.js

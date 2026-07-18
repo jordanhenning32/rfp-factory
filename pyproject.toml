@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Only the `app` package is installable. `data/` and `alembic/` are not Python packages.
+include = ["app*"]
+exclude = ["data*", "alembic*", "scripts*", "tests*"]
+
+[project]
+name = "rfp-factory"
+version = "0.1.0"
+description = "RFP Response System for Quadratic Digital LLC — multi-agent proposal factory"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "nicegui>=2.0",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "python-multipart>=0.0.9",
+    "python-dotenv>=1.0",
+    "redis>=5.0",
+    "rq>=1.16",
+    "httpx>=0.27",
+    "aiofiles>=24.1",
+    # Intake (Weeks 3-4)
+    "pdfplumber>=0.11",
+    "pypdf>=4.3",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    # LLM (Weeks 3+)
+    "anthropic>=0.39",
+    # Repair LLM-malformed JSON in tool-use fields (Anthropic streaming
+    # tool-use occasionally leaves unescaped chars in string values).
+    "json_repair>=0.59",
+]
+
+[project.optional-dependencies]
+# OCR fallback for scanned PDFs (Step 4) — needs the tesseract binary on PATH
+ocr = [
+    "pytesseract>=0.3.10",
+    "Pillow>=10.4",
+]
+# Document output (Week 11)
+output = [
+    "docxtpl>=0.18",
+]
+# Additional LLM providers (Weeks 3+)
+llm_extra = [
+    "openai>=1.50",
+    "google-genai>=0.3",
+]
+# Embedding provider — only needed when chunked retrieval lands (Phase 2,
+# currently deferred). Voyage's wheel availability lags Python releases;
+# install separately when actually needed.
+embeddings = [
+    "voyageai>=0.3",
+]
+# Observability
+obs = [
+    "sentry-sdk[fastapi]>=2.13",
+]
+# Dev
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

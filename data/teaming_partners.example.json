@@ -1,0 +1,45 @@
+{
+  "_meta": {
+    "version": "1.0.0-sample",
+    "description": "ILLUSTRATIVE SAMPLE teaming-partner library. The Shortfall Strategist reads this to recommend teaming as a gap mitigation. All partners here are fictional. Copy to data/teaming_partners.json and replace with your own confirmed relationships to run the system.",
+    "edit_instructions": "Use confirmed=true only for partners with an active teaming agreement. confirmed=false partners are suggested but flagged [NEEDS_HUMAN]."
+  },
+  "partners": [
+    {
+      "name": "Sample Prime Partners Inc.",
+      "confirmed": true,
+      "relationship_summary": "Existing prime — we have subcontracted on a sample modernization program.",
+      "core_capabilities": ["human-centered design", "cloud infrastructure", "public-sector software", "user research"],
+      "certifications_set_asides": ["Small Business"],
+      "geographic_presence": ["national, remote-first"],
+      "good_fit_for": ["design-heavy scopes", "research + software combined", "cloud migration"],
+      "contact": {
+        "website": "https://example-prime.example.com",
+        "primary_location": "Anytown, USA",
+        "general_email": "info@example-prime.example.com",
+        "linkedin": "https://www.linkedin.com/company/example-prime",
+        "notes": "Sample contact notes. Real BD contacts should never be committed."
+      }
+    },
+    {
+      "name": "Sample Niche Data Co.",
+      "confirmed": false,
+      "relationship_summary": "Prospective partner — strong data/analytics fit, not yet engaged.",
+      "core_capabilities": ["data engineering", "analytics", "MLOps"],
+      "certifications_set_asides": ["8(a) (sample)"],
+      "geographic_presence": ["remote"],
+      "good_fit_for": ["data platform gaps", "analytics scopes"],
+      "contact": {
+        "website": "https://example-data.example.com",
+        "primary_location": "Remote",
+        "general_email": "hello@example-data.example.com",
+        "linkedin": "https://www.linkedin.com/company/example-data",
+        "notes": "[NEEDS_HUMAN] — confirm relationship before naming in a proposal."
+      }
+    }
+  ],
+  "partners_to_add": {
+    "_note": "Categories of partners to look for when gaps recur.",
+    "categories": ["cleared staffing", "specialized cyber", "hardware/OEM", "8(a) set-aside", "regional presence", "niche domain expertise"]
+  }
+}

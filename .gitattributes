@@ -1,0 +1,7 @@
+# Force LF for shell scripts and Dockerfile so they run correctly inside Linux containers.
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf
+
+# Default to native; let Git decide for source files.
+* text=auto

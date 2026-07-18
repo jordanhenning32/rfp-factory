@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    container_name: rfp-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./data:/app/data
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    container_name: rfp-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["worker"]
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+    depends_on:
+      - redis
+      - app
+
+  redis:
+    image: redis:7-alpine
+    container_name: rfp-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
