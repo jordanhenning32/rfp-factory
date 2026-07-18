@@ -3,7 +3,7 @@
 **A multi-agent system that turns a federal RFP package into a submission-ready proposal — compliance matrix, gap analysis, priced cost volume, drafted narrative, adversarial review, and a polished DOCX — in under two hours instead of forty.**
 
 RFP Factory ingests an RFP package (PDFs/DOCX) and drives it through a fixed,
-human-checkpointed pipeline staffed by **34 specialized LLM agents**. It extracts
+human-checkpointed pipeline staffed by **a role-separated fleet of specialized LLM agents**. It extracts
 every requirement verbatim, analyzes capability gaps and recommends mitigations,
 builds a defensible cost/P&L across three pricing scenarios, drafts every section
 grounded in a company knowledge base, runs a dual-model adversarial review loop,
@@ -49,7 +49,7 @@ RFP Factory is engineered around those failure modes:
 | Design decision | Why |
 |---|---|
 | **Fixed pipeline with human gates** (not a one-click macro) | Every consequential decision — scope sign-off, outline approval, team roster, accept/dismiss findings — stays with a person. Auto-apply behaviors exist but are bounded, reversible, and audit-logged. |
-| **Multi-provider routing, per role** | Gemini 2.5 Pro's huge context window is best for whole-corpus synthesis and validation; Claude Opus/Sonnet is best for drafting and reasoning; Haiku handles cheap extraction. Each of the 34 agents runs on the model that's strongest for its job. |
+| **Multi-provider routing, per role** | Gemini 2.5 Pro's huge context window is best for whole-corpus synthesis and validation; Claude Opus/Sonnet is best for drafting and reasoning; Haiku handles cheap extraction. Each agent role runs on the model that's strongest for its job. |
 | **Cross-provider validation** | The Compliance Matrix (Sonnet) is validated by a *different provider* (Gemini) — a same-family validator shares blind spots with the drafter and is near-useless. Different provider = genuinely independent second opinion. |
 | **Dual-pipeline adversarial research** | Teaming and market research each run two providers in parallel (Gemini grounded + Claude web-search) and reconcile via a pure-Python consolidator. Cross-provider *agreement* is itself evidence; single-provider hits are flagged `needs_review`. |
 | **Grounded generation (RAG), not free recall** | A cached ~58K-token prefix — company profile + knowledge base + teaming library + institutional decisions — is injected into every writer call. Citations trace only to won/subbed past performance; Reviewer A enforces it. |
