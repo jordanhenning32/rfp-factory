@@ -18,7 +18,7 @@ Two empty-state paths:
 Per-phase actions: Edit (dialog with all fields) · Delete (confirm
 prompt). Anchor-date picker in the header card lets the user
 optionally tie offsets to absolute calendar dates for a phase
-("d0–d30" becomes "Jun 1 – Jun 30"). Government RFPs typically
+("d0–d29" becomes "Jun 1 – Jun 30" for a 30-day phase). Government RFPs typically
 specify schedule in offsets so the anchor is opt-in.
 """
 
@@ -58,6 +58,11 @@ _PHASE_COLOR_PALETTE: list[tuple[str, str]] = [
     ("Violet", "#7C3AED"),
     ("Slate", "#475569"),
 ]
+
+
+def _inclusive_end_offset(start_offset: int, duration: int) -> int:
+    """Last covered day for a zero-based offset and day-count duration."""
+    return start_offset + duration - 1
 
 
 def _render_timeline_tab(proposal_id: int, *, on_state_change=None) -> None:
@@ -134,9 +139,16 @@ def _render_header_card(
                         f"{total} day total span",
                     ]
                     if anchor:
-                        end = anchor + timedelta(days=total)
-                        summary_bits.append(f"{anchor.strftime('%b %d, %Y')} → {end.strftime('%b %d, %Y')}")
-                    ui.label(" · ".join(summary_bits)).classes("text-xs opacity-60 pt-2 font-mono")
+                        end = anchor + timedelta(
+                            days=_inclusive_end_offset(0, total)
+                        )
+                        summary_bits.append(
+                            f"{anchor.strftime('%b %d, %Y')} → "
+                            f"{end.strftime('%b %d, %Y')}"
+                        )
+                    ui.label(" · ".join(summary_bits)).classes(
+                        "text-xs opacity-60 pt-2 font-mono"
+                    )
 
             # Right side: actions.
             with ui.column().classes("gap-2 items-end"):
@@ -176,7 +188,9 @@ def _render_header_card(
                         .props("dense outlined")
                         .classes("w-36")
                     )
-                    anchor_input.props("type=date")
+                    anchor_input.props(
+                        'type=date aria-label="Anchor date"'
+                    )
 
                     def _save_anchor() -> None:
                         v = (anchor_input.value or "").strip()
@@ -195,9 +209,11 @@ def _render_header_card(
                         on_change()
 
                     ui.button(
-                        icon="check",
-                        on_click=_save_anchor,
-                    ).props("flat dense round size=sm").tooltip(
+                        icon="check", on_click=_save_anchor,
+                    ).props(
+                        'flat dense round size=sm '
+                        'aria-label="Apply anchor date"'
+                    ).tooltip(
                         "Apply the anchor date. Once set, phase "
                         "labels show absolute dates alongside the "
                         "day-offsets."
@@ -211,9 +227,11 @@ def _render_header_card(
                             on_change()
 
                         ui.button(
-                            icon="close",
-                            on_click=_clear_anchor,
-                        ).props("flat dense round size=sm color=red-7").tooltip("Clear the anchor date.")
+                            icon="close", on_click=_clear_anchor,
+                        ).props(
+                            'flat dense round size=sm color=red-7 '
+                            'aria-label="Clear anchor date"'
+                        ).tooltip("Clear the anchor date.")
 
 
 # ---- Empty state ---------------------------------------------------------
@@ -302,7 +320,13 @@ def _render_day_axis(total: int, anchor: date | None) -> None:
     with ui.row().classes("w-full pl-48 pr-32"):
         with ui.element("div").classes("flex-1 relative h-6 border-b border-slate-300"):
             for pct in ticks:
-                day = round(total * pct / 100)
+                # ``total`` is an elapsed-day span used for bar geometry.
+                # Calendar labels are inclusive, so the last covered day of
+                # a 30-day span is d29 rather than the d30 boundary.
+                day = min(
+                    round(total * pct / 100),
+                    _inclusive_end_offset(0, total),
+                )
                 if anchor:
                     label = (anchor + timedelta(days=day)).strftime("%b %d")
                 else:
@@ -328,7 +352,9 @@ def _render_gantt_row(
         return
     left_pct = phase["start_offset"] / total * 100
     width_pct = phase["duration"] / total * 100
-    end_offset = phase["start_offset"] + phase["duration"]
+    end_offset = _inclusive_end_offset(
+        phase["start_offset"], phase["duration"]
+    )
 
     if anchor:
         start_date = anchor + timedelta(days=phase["start_offset"])
@@ -400,7 +426,9 @@ def _render_phase_row(
     on_change,
 ) -> None:
     """One phase as an actionable row card."""
-    end_offset = phase["start_offset"] + phase["duration"]
+    end_offset = _inclusive_end_offset(
+        phase["start_offset"], phase["duration"]
+    )
     if anchor:
         start_date = anchor + timedelta(days=phase["start_offset"])
         end_date = anchor + timedelta(days=end_offset)
@@ -436,7 +464,9 @@ def _render_phase_row(
                         phase=p,
                         on_saved=on_change,
                     ),
-                ).props("flat dense round size=sm").tooltip("Edit")
+                ).props(
+                    'flat dense round size=sm aria-label="Edit phase"'
+                ).tooltip("Edit")
                 ui.button(
                     icon="delete",
                     on_click=lambda p=phase: _confirm_delete(
@@ -444,7 +474,10 @@ def _render_phase_row(
                         p,
                         on_change,
                     ),
-                ).props("flat dense round size=sm color=red-7").tooltip("Delete")
+                ).props(
+                    'flat dense round size=sm color=red-7 '
+                    'aria-label="Delete phase"'
+                ).tooltip("Delete")
 
 
 # ---- Dialogs -------------------------------------------------------------
@@ -592,7 +625,18 @@ def _open_phase_dialog(
                     "color": selected_color["value"],
                 }
                 if is_edit:
-                    update_phase(proposal_id, phase["id"], **fields)
+                    updated = update_phase(
+                        proposal_id, phase["id"], **fields
+                    )
+                    if updated is None:
+                        dialog.close()
+                        ui.notify(
+                            "Update failed — phase may have already "
+                            "been removed. The timeline was refreshed.",
+                            type="warning",
+                        )
+                        on_saved()
+                        return
                     ui.notify(f"Updated '{name}'.", type="positive")
                 else:
                     add_phase(proposal_id, **fields)

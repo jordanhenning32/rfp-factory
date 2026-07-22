@@ -1,9 +1,4 @@
-"""All NiceGUI page registrations.
-
-Foundation phase — pages are skeletons. Real interactions land in Weeks 3+ as
-the agent pipeline is wired up.
-"""
-
+"""NiceGUI page registrations for the complete RFP workflow."""
 from __future__ import annotations
 
 import asyncio
@@ -15,11 +10,13 @@ from typing import Any
 
 from fastapi import Request
 from nicegui import ui
+from nicegui.timer import Timer as BackgroundTimer
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
 from app.agents.intake_metadata import ExtractedMetadata, extract_metadata_from_text
 from app.agents.kb_classify import ClassificationResult, classify_kb_upload
+from app.config import get_settings
 from app.core.company_profile import (
     get_capability_areas,
     get_certifications,
@@ -86,10 +83,17 @@ from app.services.proposals import (
     create_proposal_with_files,
     delete_proposal,
     find_duplicate_rfp_documents,
+    reset_for_intake_retry,
 )
 from app.services.service_line import (
     SERVICE_LINE_PAYMENT_SYSTEMS,
     get_service_line,
+)
+from app.services.workflow import (
+    approve_for_submission,
+    archive_proposal,
+    mark_submitted,
+    sign_off_scope,
 )
 from app.ui._shared import _empty_state
 from app.ui.layout import page_frame
@@ -311,11 +315,16 @@ def home() -> None:
                                     )
                                     ui.chip(s["outcome"]).props(f"color={color} text-color=black dense")
                                 ui.label(f"#{s['id']}").classes("text-xs opacity-50 font-mono")
-                                # stop_propagation so click doesn't navigate the row.
-                                ui.button(
-                                    icon="delete_outline",
-                                    on_click=lambda e, pid=s["id"], t=s["title"]: _confirm_delete(pid, t),
-                                ).props("flat dense color=negative").on("click.stop", lambda: None)
+                                # Archived proposals are immutable audit records;
+                                # deletion is unavailable even from the list page.
+                                if s["status"] != ProposalStatus.ARCHIVED.value:
+                                    # stop_propagation so click doesn't navigate the row.
+                                    ui.button(
+                                        icon="delete_outline",
+                                        on_click=lambda e, pid=s["id"], t=s["title"]: _confirm_delete(pid, t),
+                                    ).props("flat dense color=negative").on(
+                                        "click.stop", lambda: None
+                                    )
 
         render_list()
 
@@ -362,7 +371,7 @@ def _open_cost_estimate_dialog(staged: dict[str, bytes]) -> None:
             ui.label(f"${cost:.2f}").classes(f"text-sm font-mono {weight}")
 
     with ui.dialog() as dlg, ui.card().classes("min-w-[36rem] max-w-[44rem]"):
-        ui.label("Pipeline cost estimate").classes("text-base font-semibold")
+        ui.label("Estimated API cost").classes("text-base font-semibold")
         ui.label(
             f"~{est.pages_estimated} page(s), ~{est.tokens_estimated:,} "
             f"tokens, ~{est.requirements_estimated} compliance items "
@@ -376,8 +385,19 @@ def _open_cost_estimate_dialog(staged: dict[str, bytes]) -> None:
                 "text-[10px] font-semibold tracking-wider text-blue-800 uppercase"
             )
             with ui.column().classes("gap-1 pt-1 w-full"):
-                _row("Metadata extraction (Haiku)", est.intake_metadata)
-                _row("Compliance Matrix Agent", est.compliance_matrix)
+                _row("Metadata extraction (lightweight model)", est.intake_metadata)
+                _row(
+                    f"Requirement extraction ({est.compliance_extraction_model})",
+                    est.compliance_matrix,
+                )
+                _row(
+                    f"Independent + source review ({est.compliance_review_model})",
+                    est.compliance_review,
+                )
+                _row(
+                    f"Fallback contingency ({est.compliance_fallback_model})",
+                    est.compliance_fallback_contingency,
+                )
                 _row("Shortfall Strategist", est.shortfall)
                 ui.separator()
                 _row("Intake subtotal", est.intake_total, bold=True)
@@ -398,7 +418,7 @@ def _open_cost_estimate_dialog(staged: dict[str, bytes]) -> None:
                     est.reviewer_loop,
                 )
                 _row(
-                    "Writer revisions (Opus)",
+                    "Writer revisions (scheduled models)",
                     est.writer_revisions,
                 )
                 ui.separator()
@@ -423,6 +443,8 @@ def _open_cost_estimate_dialog(staged: dict[str, bytes]) -> None:
 def new_proposal() -> None:
     # Per-page session state.
     staged: dict[str, bytes] = {}
+    staged_cost_matrices: set[str] = set()
+    staged_possible_cost_matrices: set[str] = set()
     extraction_done = {"value": False}  # mutable flag — only run once per page
 
     with page_frame("New Proposal"):
@@ -435,6 +457,8 @@ def new_proposal() -> None:
 
         with ui.card().classes("w-full"):
             staged_list = ui.column().classes("w-full")
+            staged_list.props["role"] = "list"
+            staged_list.props["aria-label"] = "Staged RFP files"
 
             def render_staged() -> None:
                 staged_list.clear()
@@ -443,14 +467,41 @@ def new_proposal() -> None:
                         ui.label("No files staged.").classes("text-sm opacity-50")
                         return
                     for name, data in staged.items():
-                        with ui.row().classes("items-center gap-2 w-full"):
+                        staged_row = ui.row().classes("items-center gap-2 w-full")
+                        staged_row.props["role"] = "listitem"
+                        staged_row.props["aria-label"] = f"Staged RFP file {name}"
+                        with staged_row:
                             ui.icon("description")
                             ui.label(name).classes("flex-1")
+                            if name in staged_cost_matrices:
+                                ui.badge(
+                                    "Cost matrix — held for pricing",
+                                    color="amber",
+                                ).props("outline").tooltip(
+                                    "Detected now; the original workbook stays unchanged "
+                                    "until cost mapping and review are complete."
+                                )
+                            elif name in staged_possible_cost_matrices:
+                                ui.badge(
+                                    "Possible cost matrix — review needed",
+                                    color="amber",
+                                ).props("outline").tooltip(
+                                    "The workbook stays in ordinary intake until you "
+                                    "confirm whether it is a fillable cost matrix."
+                                )
                             ui.label(f"{len(data) / 1024:.1f} KB").classes("text-xs opacity-60")
-                            ui.button(
+                            def remove_staged(n: str = name) -> None:
+                                staged.pop(n, None)
+                                staged_cost_matrices.discard(n)
+                                staged_possible_cost_matrices.discard(n)
+                                render_staged()
+                            remove_button = ui.button(
                                 icon="close",
-                                on_click=lambda n=name: (staged.pop(n, None), render_staged()),
+                                on_click=remove_staged,
                             ).props("flat dense")
+                            remove_button.props["aria-label"] = (
+                                f"Remove staged RFP file {name}"
+                            )
 
             render_staged()
 
@@ -471,7 +522,9 @@ def new_proposal() -> None:
                     extraction_status.classes(replace="text-sm italic text-amber-700")
                     return
                 extraction_done["value"] = True
-                extraction_status.set_text(f"Extracting metadata from {suffix.lstrip('.').upper()}… (Haiku)")
+                extraction_status.set_text(
+                    f"Extracting metadata from {suffix.lstrip('.').upper()}…"
+                )
                 extraction_status.classes(replace="text-sm italic text-blue-700")
                 try:
                     meta = await asyncio.to_thread(_run_metadata_extraction_sync, name, data)
@@ -534,12 +587,45 @@ def new_proposal() -> None:
                     data = await e.file.read()
                     name = e.file.name
                     staged[name] = data
+                    staged_cost_matrices.discard(name)
+                    staged_possible_cost_matrices.discard(name)
+                    if Path(name).suffix.lower() == ".xlsx":
+                        from app.services.cost_matrix import try_inspect_cost_matrix
+                        analysis = await asyncio.to_thread(
+                            try_inspect_cost_matrix,
+                            name,
+                            data,
+                        )
+                        if analysis is not None:
+                            classification = analysis.get("classification") or {}
+                            if classification.get("is_cost_matrix"):
+                                staged_cost_matrices.add(name)
+                            elif classification.get("possible_cost_matrix"):
+                                staged_possible_cost_matrices.add(name)
                     ui.notify(
                         f"Staged {name} ({len(data) / 1024:.1f} KB)",
                         type="positive",
                     )
                     render_staged()
-                    await maybe_extract(name, data)
+                    if name in staged_cost_matrices:
+                        extraction_status.set_text(
+                            "✓ Cost matrix detected and preserved. It will be mapped "
+                            "after requirements and pricing review; upload the "
+                            "solicitation document for metadata extraction."
+                        )
+                        extraction_status.classes(
+                            replace="text-sm italic text-amber-700"
+                        )
+                    else:
+                        await maybe_extract(name, data)
+                        if name in staged_possible_cost_matrices:
+                            extraction_status.set_text(
+                                "Possible cost matrix detected. It will remain in normal "
+                                "requirements intake until you confirm or dismiss it."
+                            )
+                            extraction_status.classes(
+                                replace="text-sm italic text-amber-700"
+                            )
                 except Exception as exc:
                     log.exception("upload handler failed")
                     ui.notify(f"Upload failed: {exc}", type="negative")
@@ -640,6 +726,8 @@ def new_proposal() -> None:
                 spawn_intake(proposal_id)
                 ui.notify(f"Proposal #{proposal_id} created — pipeline running.", type="positive")
                 staged.clear()
+                staged_cost_matrices.clear()
+                staged_possible_cost_matrices.clear()
                 ui.navigate.to(f"/proposals/{proposal_id}/progress")
 
             def on_run() -> None:
@@ -761,6 +849,82 @@ def _status_label(value: str) -> str:
     return visual[3] if visual else value.replace("_", " ").title()
 
 
+def _agent_run_status_value(run: Any) -> str:
+    status = getattr(run, "status", "")
+    return status.value if hasattr(status, "value") else str(status)
+
+
+def _progress_run_visual(run: Any, index: int) -> tuple[str, str]:
+    """Return the Progress-page icon/color for an AgentRun row.
+
+    Persisted status is authoritative. In particular, a failed `_stage` row
+    must render red even though ordinary stage rows use their trailing ellipsis
+    only to distinguish active progress from completed progress.
+    """
+    status = _agent_run_status_value(run)
+    if status == "failed":
+        return "error", "text-red-700"
+    if status == "cancelled":
+        return "cancel", "text-amber-700"
+    if getattr(run, "agent_name", "") == "_stage":
+        message = (getattr(run, "error_text", "") or "").rstrip()
+        if message.startswith("⚠"):
+            return "warning", "text-amber-700"
+        if message.endswith("…") and index == 0:
+            return "info", "text-blue-600"
+        return "check_circle", "text-green-700"
+    if status == "completed":
+        return "check_circle", "text-green-700"
+    return "autorenew", "text-blue-600"
+
+
+def _model_provider_label(model: str | None) -> str:
+    """Human-readable provider derived from the persisted exact model ID."""
+
+    value = (model or "").strip()
+    if value.startswith("claude-"):
+        return "Anthropic"
+    if value.startswith("gemini-"):
+        return "Google"
+    if value.startswith(("gpt-", "o1-", "o3-", "o4-")):
+        return "OpenAI"
+    return "Model"
+
+
+def _requirements_review_visual(status: str) -> tuple[str, str, str]:
+    return {
+        "pending": ("schedule", "text-blue-700", "Queued for review"),
+        "extracting": ("description", "text-blue-700", "Extracting"),
+        "reviewing": ("fact_check", "text-blue-700", "Reviewing"),
+        "complete": ("verified", "text-green-700", "Complete"),
+        "review_required": (
+            "warning",
+            "text-amber-700",
+            "Complete — human review needed",
+        ),
+        "degraded": (
+            "warning",
+            "text-amber-700",
+            "Fallback used — human review needed",
+        ),
+        "not_applicable": (
+            "grid_on",
+            "text-slate-600",
+            "Not a requirements source",
+        ),
+        "partial": ("error", "text-red-700", "Partial — review incomplete"),
+        "failed": ("error", "text-red-700", "Failed — manual review required"),
+        "unknown": ("error", "text-red-700", "Invalid review state — retry required"),
+    }.get(status, ("schedule", "text-slate-500", "Waiting"))
+
+
+def _requirements_review_from_structure(structure: object) -> dict:
+    """Safely normalize durable review metadata for user-facing screens."""
+    from app.services.requirements_review import normalize_requirements_review
+
+    return normalize_requirements_review(structure)
+
+
 @ui.page("/proposals/{proposal_id}/progress")
 def run_progress(proposal_id: int) -> None:
     with page_frame(f"Run Progress · #{proposal_id}"):
@@ -790,15 +954,26 @@ def run_progress(proposal_id: int) -> None:
                         ui.label(f"Role: {role_val}")
 
                 def on_retry() -> None:
-                    # Clear prior compliance items so retries don't duplicate.
-                    # Agent runs are kept for cost/audit history.
-                    with session_scope() as db:
-                        db.query(ComplianceMatrixItem).filter(
-                            ComplianceMatrixItem.proposal_id == proposal_id
-                        ).delete(synchronize_session=False)
-                        p = db.get(Proposal, proposal_id)
-                        if p:
-                            p.status = ProposalStatus.INTAKING
+                    result = reset_for_intake_retry(proposal_id)
+                    if not result.get("ok"):
+                        reason = result.get("reason")
+                        if reason == "pipeline_active":
+                            ui.notify(
+                                "Intake still has recent activity. Retry is "
+                                "blocked so a live pipeline is not erased.",
+                                type="warning",
+                                multi_line=True,
+                                timeout=6000,
+                            )
+                        elif reason == "invalid_status":
+                            ui.notify(
+                                "Retry is only available for a stuck or failed "
+                                "intake, or an incomplete requirements review.",
+                                type="warning",
+                            )
+                        else:
+                            ui.notify("Proposal not found.", type="negative")
+                        return
                     spawn_intake(proposal_id)
                     ui.notify("Retry started — pipeline re-running.", type="positive")
 
@@ -844,6 +1019,25 @@ def run_progress(proposal_id: int) -> None:
             else:
                 ui.label("No files uploaded.").classes("text-sm opacity-60")
 
+        # Durable per-document requirements-review state. Unlike transient
+        # stage text, this is keyed to each package document and remains
+        # accurate when parallel files finish out of order.
+        with ui.card().classes("w-full"):
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.label("Requirements review").classes("text-base font-medium")
+                requirements_summary = ui.label("Waiting to start").classes(
+                    "text-sm opacity-70"
+                )
+            ui.label(
+                "Configured source extraction, independent review, source-completeness "
+                "coverage, and any fallback are tracked separately for each file."
+            ).classes("text-xs opacity-60")
+            ui.label(
+                "Per-file cost is the reported review estimate; pipeline activity "
+                "also shows extraction and failed-call usage when available."
+            ).classes("text-xs opacity-50")
+            requirements_log = ui.column().classes("w-full gap-1 pt-2")
+
         # Live cards — refreshed by polling.
         with ui.card().classes("w-full"):
             ui.label("Pipeline activity").classes("text-base font-medium")
@@ -851,10 +1045,10 @@ def run_progress(proposal_id: int) -> None:
 
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center justify-between w-full"):
-                ui.label("Compliance matrix").classes("text-base font-medium")
+                ui.label("Extracted requirements").classes("text-base font-medium")
                 matrix_count_label = ui.label("0 items").classes("text-sm opacity-70")
             ui.label(
-                "Live count of requirements extracted by the Compliance Matrix Agent. "
+                "Package-wide total across all source files. "
                 "Full matrix lands on the Proposal Review page when intake completes."
             ).classes("text-xs opacity-60")
             review_link = ui.row().classes("pt-2")
@@ -873,11 +1067,26 @@ def run_progress(proposal_id: int) -> None:
                         select(AgentRun)
                         .where(AgentRun.proposal_id == proposal_id)
                         .order_by(AgentRun.id.desc())
-                        .limit(20)
+                        .limit(40)
                     )
                     .scalars()
                     .all()
                 )
+                document_reviews = []
+                if p.rfp_package is not None:
+                    for document in sorted(
+                        p.rfp_package.documents, key=lambda value: value.id
+                    ):
+                        review = _requirements_review_from_structure(
+                            document.structure_json
+                        )
+                        document_reviews.append(
+                            {
+                                "id": document.id,
+                                "filename": document.filename,
+                                "review": review,
+                            }
+                        )
                 matrix_count = (
                     db.query(ComplianceMatrixItem)
                     .filter(
@@ -886,6 +1095,154 @@ def run_progress(proposal_id: int) -> None:
                     )
                     .count()
                 )
+
+            # Durable source-by-source review state.
+            active_review_docs = [
+                row
+                for row in document_reviews
+                if row["review"].get("status")
+                in {"pending", "extracting", "reviewing"}
+            ]
+            terminal_review_docs = [
+                row
+                for row in document_reviews
+                if row["review"].get("status")
+                in {
+                    "complete",
+                    "review_required",
+                    "degraded",
+                    "not_applicable",
+                    "partial",
+                    "failed",
+                    "unknown",
+                }
+            ]
+            warning_review_docs = [
+                row
+                for row in terminal_review_docs
+                if row["review"].get("status")
+                in {"review_required", "degraded", "partial", "failed", "unknown"}
+            ]
+            if active_review_docs:
+                requirements_summary.set_text(
+                    f"{len(active_review_docs)} queued/in progress · "
+                    f"{len(terminal_review_docs)}/{len(document_reviews)} finished"
+                )
+            elif warning_review_docs:
+                requirements_summary.set_text(
+                    f"{len(terminal_review_docs)}/{len(document_reviews)} finished · "
+                    f"{len(warning_review_docs)} need attention"
+                )
+            elif terminal_review_docs:
+                requirements_summary.set_text(
+                    f"{len(terminal_review_docs)}/{len(document_reviews)} complete"
+                )
+            else:
+                requirements_summary.set_text("Waiting to start")
+
+            requirements_log.clear()
+            with requirements_log:
+                for row in document_reviews:
+                    review = row["review"]
+                    status = str(review.get("status") or "waiting")
+                    icon_name, color_cls, status_label = _requirements_review_visual(
+                        status
+                    )
+                    extraction = dict(review.get("extraction") or {})
+                    classification = dict(review.get("classification") or {})
+                    completeness = dict(review.get("completeness") or {})
+                    with ui.row().classes("items-start gap-3 w-full py-1"):
+                        ui.icon(icon_name).classes(color_cls)
+                        with ui.column().classes("gap-0 flex-1"):
+                            ui.label(
+                                f"{row['filename']} — {status_label}"
+                            ).classes(f"text-sm font-medium {color_cls}")
+                            detail_parts: list[str] = []
+                            extraction_model = extraction.get("model")
+                            if extraction_model:
+                                detail_parts.append(
+                                    f"extractor {_model_provider_label(extraction_model)} · "
+                                    f"{extraction_model}"
+                                )
+                            primary_model = classification.get("primary_model")
+                            if primary_model:
+                                detail_parts.append(
+                                    f"reviewer {_model_provider_label(primary_model)} · "
+                                    f"{primary_model}"
+                                )
+                            if classification.get("total_count") is not None:
+                                detail_parts.append(
+                                    f"items {classification.get('reviewed_count', 0)}/"
+                                    f"{classification.get('total_count', 0)}"
+                                )
+                            extraction_coverage = dict(
+                                extraction.get("coverage") or {}
+                            )
+                            if extraction_coverage.get("source_chunks_total"):
+                                detail_parts.append(
+                                    "extraction chunks "
+                                    f"{extraction_coverage.get('source_chunks_completed', 0)}/"
+                                    f"{extraction_coverage.get('source_chunks_total', 0)}"
+                                )
+                            if extraction_coverage.get("state") not in {
+                                None,
+                                "complete",
+                            }:
+                                detail_parts.append(
+                                    "extraction coverage "
+                                    + str(extraction_coverage.get("state"))
+                                )
+                            auto_applied_count = int(
+                                classification.get("auto_applied_count") or 0
+                            )
+                            if auto_applied_count:
+                                detail_parts.append(
+                                    f"{auto_applied_count} auto-corrected"
+                                )
+                            human_review_count = (
+                                int(classification.get("manual_review_count") or 0)
+                                + int(
+                                    completeness.get(
+                                        "manual_review_candidate_count"
+                                    )
+                                    or 0
+                                )
+                                + int(
+                                    completeness.get("uncertain_passage_count") or 0
+                                )
+                            )
+                            if human_review_count:
+                                detail_parts.append(
+                                    f"{human_review_count} need human review"
+                                )
+                            if completeness.get("source_units_total") is not None:
+                                detail_parts.append(
+                                    f"source units {completeness.get('reviewed_units', 0)}/"
+                                    f"{completeness.get('source_units_total', 0)}"
+                                )
+                            if classification.get("fallback_used") or completeness.get(
+                                "fallback_used"
+                            ):
+                                fallback_model = classification.get(
+                                    "fallback_model"
+                                ) or completeness.get("fallback_model")
+                                detail_parts.append(f"fallback {fallback_model}")
+                            if detail_parts:
+                                ui.label(" · ".join(detail_parts)).classes(
+                                    "text-xs opacity-65"
+                                )
+                            reason = str(review.get("reason") or "").strip()
+                            if reason:
+                                ui.label(reason).classes("text-xs opacity-65")
+                        review_cost = float(
+                            review.get("known_review_cost_usd")
+                            or review.get("estimated_cost_usd")
+                            or 0
+                        )
+                        if review_cost > 0:
+                            ui.label(f"review est. ${review_cost:.4f}").classes(
+                                "text-xs opacity-60 font-mono"
+                            )
 
             # Status badge — clickable, navigates to Proposal Review.
             status_row.clear()
@@ -941,6 +1298,8 @@ def run_progress(proposal_id: int) -> None:
             # banner for the others still running.
             fresh_stage_in_flight = False
             for stage in stages_recent:
+                if _agent_run_status_value(stage) == "failed":
+                    continue
                 msg = (stage.error_text or "").rstrip()
                 if not msg.endswith("…"):
                     continue
@@ -955,7 +1314,11 @@ def run_progress(proposal_id: int) -> None:
                     break
 
             is_busy = (
-                bool(status_busy) or bool(loop_running) or bool(active_sections) or fresh_stage_in_flight
+                bool(status_busy)
+                or bool(loop_running)
+                or bool(active_sections)
+                or bool(active_review_docs)
+                or fresh_stage_in_flight
             )
             busy_stage_obj = None
             in_flight_stage_obj = None
@@ -967,6 +1330,8 @@ def run_progress(proposal_id: int) -> None:
                 # recent stage is a completion message (parallel regens
                 # racing), the in-flight start-stage is what matters.
                 for stage in stages_recent:
+                    if _agent_run_status_value(stage) == "failed":
+                        continue
                     msg = (stage.error_text or "").rstrip()
                     if msg.endswith("…"):
                         in_flight_stage_obj = stage
@@ -979,8 +1344,35 @@ def run_progress(proposal_id: int) -> None:
             # signal but no in-flight stage is visible in the last 20
             # rows (start-stage aged out, or completion-stage races).
             n_active = len(active_sections)
-            if active_sections and in_flight_stage_obj is None:
-                latest_msg = f"Regenerating {n_active} section{'s' if n_active != 1 else ''}…"
+            if active_review_docs and in_flight_stage_obj is None:
+                active_row = active_review_docs[0]
+                active_review = active_row["review"]
+                active_status = active_review.get("status")
+                if active_status == "extracting":
+                    model = (
+                        (active_review.get("extraction") or {}).get("model")
+                        or "configured extraction model"
+                    )
+                    latest_msg = (
+                        f"{active_row['filename']}: extracting requirements "
+                        f"with {model}…"
+                    )
+                else:
+                    model = (
+                        (active_review.get("classification") or {}).get(
+                            "primary_model"
+                        )
+                        or "configured review model"
+                    )
+                    latest_msg = (
+                        f"{active_row['filename']}: reviewing requirements "
+                        f"with {model}…"
+                    )
+            elif active_sections and in_flight_stage_obj is None:
+                latest_msg = (
+                    f"Regenerating {n_active} section"
+                    f"{'s' if n_active != 1 else ''}…"
+                )
             elif busy_stage_obj is not None:
                 latest_msg = busy_stage_obj.error_text or "Auto review-revise loop running…"
             else:
@@ -1014,39 +1406,37 @@ def run_progress(proposal_id: int) -> None:
                     ui.label("Waiting for the pipeline to start…").classes("text-sm opacity-60")
                 for idx, run in enumerate(recent_runs):
                     is_stage = run.agent_name == "_stage"
-                    label_text = run.error_text if is_stage else run.agent_name
+                    if is_stage:
+                        label_text = run.error_text
+                    else:
+                        agent_label = (run.agent_name or "agent").replace("_", " ")
+                        label_text = agent_label
+                        if run.model_used:
+                            label_text += (
+                                f" · {_model_provider_label(run.model_used)} · "
+                                f"{run.model_used}"
+                            )
+                        run_status = _agent_run_status_value(run)
+                        if run_status == "failed":
+                            label_text += " — failed"
+                        elif run_status == "cancelled":
+                            label_text += " — cancelled"
                     when = run.completed_at or run.started_at or run.created_at
                     timestamp = when.strftime("%H:%M:%S") if when else "—"
 
                     with ui.row().classes("items-center gap-3 w-full py-0.5"):
-                        if is_stage:
-                            # Stage messages ending with "…" mean "work in flight".
-                            # If a newer entry exists (idx > 0), the work has been
-                            # superseded → completed. Only the very latest "…" stage
-                            # is actually still running.
-                            stripped = (label_text or "").rstrip()
-                            ends_with_ellipsis = stripped.endswith("…")
-                            is_active = ends_with_ellipsis and idx == 0
-                            if is_active:
-                                ui.icon("info").classes("text-blue-600")
-                            else:
-                                ui.icon("check_circle").classes("text-green-700")
-                        elif run.status == "completed" or (
-                            hasattr(run.status, "value") and run.status.value == "completed"
-                        ):
-                            ui.icon("check_circle").classes("text-green-700")
-                        elif run.status == "failed" or (
-                            hasattr(run.status, "value") and run.status.value == "failed"
-                        ):
-                            ui.icon("error").classes("text-red-700")
-                        else:
-                            ui.icon("autorenew").classes("text-blue-600")
+                        icon_name, icon_color = _progress_run_visual(run, idx)
+                        ui.icon(icon_name).classes(icon_color)
                         ui.label(timestamp).classes("text-xs opacity-60 w-20 font-mono")
                         ui.label(label_text or "(no message)").classes("flex-1 text-sm")
                         if run.cost_usd and float(run.cost_usd) > 0:
-                            ui.label(f"${float(run.cost_usd):.4f}").classes("text-xs opacity-60 font-mono")
+                            ui.label(f"est. ${float(run.cost_usd):.4f}").classes(
+                                "text-xs opacity-60 font-mono"
+                            )
 
-            matrix_count_label.set_text(f"{matrix_count} item{'s' if matrix_count != 1 else ''}")
+            matrix_count_label.set_text(
+                f"{matrix_count} package item{'s' if matrix_count != 1 else ''}"
+            )
 
             review_link.clear()
             with review_link:
@@ -1057,9 +1447,24 @@ def run_progress(proposal_id: int) -> None:
                         on_click=lambda: ui.navigate.to(f"/proposals/{proposal_id}"),
                     ).props("color=primary flat")
 
-        # Initial render + 2s polling
+        # Initial render + 2s polling. A regular ui.timer belongs to the
+        # current parent slot and can race with page teardown: its loop may try
+        # to enter a slot just after NiceGUI deletes that slot. Keep this timer
+        # outside the element tree and stop it as soon as its page disappears.
         refresh()
-        ui.timer(2.0, refresh)
+        poll_timer: BackgroundTimer | None = None
+
+        def poll_refresh() -> None:
+            if status_row.is_deleted:
+                if poll_timer is not None:
+                    poll_timer.cancel(with_current_invocation=True)
+                return
+            refresh()
+
+        poll_timer = BackgroundTimer(2.0, poll_refresh, immediate=False)
+        ui.context.client.on_delete(
+            lambda: poll_timer.cancel(with_current_invocation=True)
+        )
 
 
 # ----- Proposal Review -----------------------------------------------------------
@@ -1234,13 +1639,15 @@ def _compute_tab_badges(proposal_id: int) -> dict[str, int]:
                     n_draft_action += 1
         badges["draft"] = n_draft_action
 
-        # Reviewer Findings — pending (unaccepted, undismissed, unresolved).
+        # Reviewer Findings — every unresolved action. Pending findings
+        # still need a triage decision; accepted findings still need to be
+        # applied to the section and verified by a follow-up review. Dismissed
+        # and resolved findings are audit history, not actions.
         if section_pks:
             badges["findings"] = (
                 db.query(ReviewerFinding)
                 .filter(
                     ReviewerFinding.proposal_section_id.in_(section_pks),
-                    ReviewerFinding.accepted_at.is_(None),
                     ReviewerFinding.dismissed_at.is_(None),
                     ReviewerFinding.resolved_in_pass_number.is_(None),
                 )
@@ -1309,6 +1716,7 @@ def proposal_review(proposal_id: int) -> None:
                     "requirement_id": i.requirement_id,
                     "requirement_text": i.requirement_text,
                     "source_doc": i.source_doc,
+                    "source_document_id": i.source_document_id,
                     "source_section": i.source_section or "",
                     "source_page": i.source_page,
                     "type": i.requirement_type.value
@@ -1321,6 +1729,22 @@ def proposal_review(proposal_id: int) -> None:
                 }
                 for i in items
             ]
+            requirements_reviews = []
+            if proposal.rfp_package is not None:
+                for document in sorted(
+                    proposal.rfp_package.documents, key=lambda value: value.id
+                ):
+                    review = _requirements_review_from_structure(
+                        document.structure_json
+                    )
+                    if review:
+                        requirements_reviews.append(
+                            {
+                                "id": document.id,
+                                "filename": document.filename,
+                                "review": review,
+                            }
+                        )
 
         # Snapshot gaps + deal-breaker count for the header banner / Gaps tab.
         with SessionLocal() as db:
@@ -1498,14 +1922,27 @@ def proposal_review(proposal_id: int) -> None:
         # callback the banner already captured.
         _tab_handle["widget"] = tabs
 
-        def refresh_outer_chrome() -> None:
-            """Recompute tab badge counts + refresh the next-step banner.
+        _submission_checklist_refresh: dict = {"callback": None}
+
+        def refresh_outer_chrome(*, refresh_submission: bool = True) -> None:
+            """Refresh shared proposal state after an in-tab mutation.
+
+            Recomputes tab badge counts and the next-step banner, then
+            refreshes the Submission Checklist's deterministic readiness
+            snapshot so cross-tab changes are visible without a page reload.
             Called from in-tab handlers after they mutate state, so the
             page chrome stays in sync without a full page reload."""
             new_counts = _compute_tab_badges(proposal_id)
             for key, widget in badge_widgets.items():
                 _update_badge(widget, new_counts.get(key, 0))
             _render_next_step_banner.refresh()
+            callback = _submission_checklist_refresh["callback"]
+            if refresh_submission and callback is not None:
+                callback()
+
+        def refresh_chrome_from_submission() -> None:
+            """Refresh shared chrome after the checklist refreshed itself."""
+            refresh_outer_chrome(refresh_submission=False)
 
         # Outcome panel — only for terminal statuses where an outcome
         # actually makes sense (submitted / approved / archived).
@@ -1515,6 +1952,7 @@ def proposal_review(proposal_id: int) -> None:
             _render_outcome_panel(
                 proposal_id,
                 on_state_change=refresh_outer_chrome,
+                read_only=status_val == ProposalStatus.ARCHIVED.value,
             )
 
         # Default tab logic — give the user the most relevant landing tab
@@ -1532,9 +1970,9 @@ def proposal_review(proposal_id: int) -> None:
         else:
             default_tab = "Compliance"
 
-        with ui.tab_panels(tabs, value=default_tab).classes("w-full"):
+        with ui.tab_panels(tabs, value=default_tab).classes("w-full") as tab_panels:
             with ui.tab_panel("Compliance"):
-                _render_compliance_tab(matrix_rows)
+                _render_compliance_tab(matrix_rows, requirements_reviews)
             with ui.tab_panel("Evaluation Criteria"):
 
                 def _rerun_section_m(pid=proposal_id):
@@ -1596,9 +2034,11 @@ def proposal_review(proposal_id: int) -> None:
             with ui.tab_panel("Completed Draft"):
                 _render_completed_draft_tab(proposal_id)
             with ui.tab_panel("Submission Checklist"):
-                _render_submission_checklist_tab(
-                    proposal_id,
-                    on_state_change=refresh_outer_chrome,
+                _submission_checklist_refresh["callback"] = (
+                    _render_submission_checklist_tab(
+                        proposal_id,
+                        on_state_change=refresh_chrome_from_submission,
+                    )
                 )
             with ui.tab_panel("Timeline"):
                 _render_timeline_tab(
@@ -1607,6 +2047,23 @@ def proposal_review(proposal_id: int) -> None:
                 )
             with ui.tab_panel("Spend"):
                 _render_spend_tab(proposal_id)
+
+        # Archived proposals are an audit record. Keep every tab readable and
+        # navigable, but disable all controls inside the panels so the
+        # "Archived (read-only)" contract is real rather than cosmetic. The
+        # top-level tab selectors live outside ``tab_panels``. Nested tabs and
+        # expansion panels are also view navigation, not mutations, so leave
+        # those enabled or archived detail would become inaccessible.
+        if status_val == ProposalStatus.ARCHIVED.value:
+            from nicegui.elements.expansion import Expansion
+            from nicegui.elements.mixins.disableable_element import DisableableElement
+            from nicegui.elements.tabs import Tab, TabPanel
+
+            for element in tab_panels.descendants():
+                if isinstance(element, (Tab, TabPanel, Expansion)):
+                    continue
+                if isinstance(element, DisableableElement):
+                    element.disable()
 
 
 # `_SEVERITY_VISUAL` and `_SEVERITY_ORDER` moved to
@@ -1819,9 +2276,9 @@ def _render_next_step_banner(
                     "disclosures, estimate annual processed volume, "
                     "and recommend a competitive bid posture. The "
                     "Cost Volume Writer drafts the fee narrative "
-                    "from that recommendation. (Cost Analyst / Cost "
-                    "Reviewer don't run for payment_systems — no "
-                    "labor build to make.)"
+                    "from that recommendation. The labor-based Cost "
+                    "Analyst is skipped; the payment-specific Cost Reviewer "
+                    "then fact-checks the narrative against the scan."
                 ),
                 "btn": {
                     "label": "Open Cost tab",
@@ -1942,8 +2399,8 @@ def _render_next_step_banner(
         "border": "border-green-500",
         "title": "Draft ready — run the Auto Review-Revise Loop",
         "body": (
-            "Each section iterates Reviewer A (Opus, compliance & risk) + "
-            "Reviewer B (Gemini, persuasion) and Writer Team for up to 6 "
+            "Each section iterates Reviewer A (compliance & risk) + "
+            "Reviewer B (persuasion) and Writer Team for up to 6 "
             "passes. ALL findings auto-revise. Pass 3+ escalates: writer "
             "is told to delete or [NEEDS_HUMAN]-wrap content reviewers "
             "keep flagging. Stuck-detection bails after 2 consecutive "
@@ -1952,11 +2409,21 @@ def _render_next_step_banner(
             "~$30-100 per full proposal depending on how many sections "
             "need escalation."
         ),
-        "btn": {
-            "label": "Run Auto Review-Revise Loop",
-            "icon": "all_inclusive",
-            "on_click": lambda: _run_reviewer_loop(proposal_id),
-        },
+        "btn": None,
+        "btns": [
+            {
+                "label": "Run Auto Review-Revise Loop",
+                "icon": "all_inclusive",
+                "on_click": lambda: _run_reviewer_loop(proposal_id),
+                "props": "color=primary",
+            },
+            {
+                "label": "Approve for submission",
+                "icon": "check_circle",
+                "on_click": lambda: _approve_proposal(proposal_id),
+                "props": "flat color=positive",
+            },
+        ],
     }
     spec["reviewing"] = {
         "icon": "all_inclusive",
@@ -1965,7 +2432,7 @@ def _render_next_step_banner(
         "border": "border-blue-500",
         "title": "Auto Review-Revise Loop running",
         "body": (
-            "Reviewer A (Opus) + Reviewer B (Gemini) and Writer Team are "
+            "Reviewer A + Reviewer B and Writer Team are "
             "passing each section back and forth until clean, capped, or "
             "stuck. Watch live progress on Run Progress. Cancel will stop "
             "at the next checkpoint (~30-90s after the current LLM call)."
@@ -1996,7 +2463,8 @@ def _render_next_step_banner(
         "title": "Cost Analysis running",
         "body": (
             "Cost Analysis Agent is building the pricing breakdown and P&L. "
-            "Cost Reviewer will validate after. — Weeks 12-13 of the design doc."
+            "Cost Reviewer will validate it next. Follow live progress on "
+            "Run Progress."
         ),
         "btn": None,
     }
@@ -2039,8 +2507,15 @@ def _render_next_step_banner(
         "bg": "bg-green-50",
         "border": "border-green-500",
         "title": "Submitted",
-        "body": "Awaiting agency response. The proposal sections, drafts, and decisions are all preserved on the Run Progress page for review.",
-        "btn": None,
+        "body": (
+            "Keep this record active while awaiting the agency response. "
+            "After recording the award outcome and any debrief, archive it "
+            "to make the complete record read-only."
+        ),
+        "btn": {
+            "label": "Archive proposal", "icon": "inventory_2",
+            "on_click": lambda: _archive_proposal(proposal_id),
+        },
     }
     spec["archived"] = {
         "icon": "inventory_2",
@@ -2091,10 +2566,13 @@ def _render_next_step_banner(
 
 
 def _sign_off_scope(proposal_id: int) -> None:
-    with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
-        if p:
-            p.status = ProposalStatus.DRAFTING
+    result = sign_off_scope(proposal_id)
+    if not result["ok"]:
+        ui.notify(
+            "Scope cannot be signed off yet:\n" + "\n".join(result["blockers"][:4]),
+            type="warning", multi_line=True, timeout=8000,
+        )
+        return
     ui.notify(
         "Scope signed off — click Generate Draft Outline to propose a section structure.",
         type="positive",
@@ -2287,8 +2765,8 @@ def _cancel_auto_review(proposal_id: int) -> None:
                     proposal_id=proposal_id,
                     agent_name="_stage",
                     model_used=None,
-                    started_at=_dt.utcnow(),
-                    completed_at=_dt.utcnow(),
+                    started_at=_dt.now(UTC),
+                    completed_at=_dt.now(UTC),
                     status="completed",
                     error_text=(
                         "🛑 Status reset by user — no active loop was running "
@@ -2363,24 +2841,72 @@ def _apply_accepted_findings(proposal_id: int, section_pk: int) -> None:
 
 
 def _approve_proposal(proposal_id: int) -> None:
-    with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
-        if p:
-            p.status = ProposalStatus.APPROVED
+    result = approve_for_submission(proposal_id)
+    if not result["ok"]:
+        ui.notify(
+            "Approval blocked:\n" + "\n".join(result["blockers"][:5]),
+            type="warning", multi_line=True, timeout=10000,
+        )
+        return
     ui.notify("Approved for submission.", type="positive")
     ui.navigate.reload()
 
 
 def _mark_submitted(proposal_id: int) -> None:
-    with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
-        if p:
-            p.status = ProposalStatus.SUBMITTED
-            from datetime import datetime as _dt
+    with ui.dialog() as dialog, ui.card().classes("max-w-lg"):
+        ui.label("Confirm submission").classes("text-lg font-semibold")
+        ui.label(
+            "Only mark this proposal submitted after it has been delivered "
+            "through the agency's required channel. This app never submits it for you."
+        ).classes("text-sm")
 
-            p.submitted_at = _dt.utcnow()
-    ui.notify("Marked as submitted.", type="positive")
-    ui.navigate.reload()
+        def confirm() -> None:
+            result = mark_submitted(proposal_id)
+            if not result["ok"]:
+                ui.notify(
+                    "Cannot mark submitted:\n" + "\n".join(result["blockers"][:5]),
+                    type="warning", multi_line=True, timeout=10000,
+                )
+                return
+            dialog.close()
+            ui.notify("Marked as submitted.", type="positive")
+            ui.navigate.reload()
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+            ui.button("Confirm submitted", icon="send", on_click=confirm).props(
+                "color=primary"
+            )
+    dialog.open()
+
+
+def _archive_proposal(proposal_id: int) -> None:
+    with ui.dialog() as dialog, ui.card().classes("max-w-lg"):
+        ui.label("Archive proposal?").classes("text-lg font-semibold")
+        ui.label(
+            "Archiving preserves the proposal, package, drafts, decisions, and "
+            "run history, but makes every proposal tab read-only. Record any "
+            "award outcome and debrief details first; there is no unarchive flow."
+        ).classes("text-sm")
+
+        def confirm() -> None:
+            result = archive_proposal(proposal_id)
+            if not result["ok"]:
+                ui.notify(
+                    "Cannot archive:\n" + "\n".join(result["blockers"][:5]),
+                    type="warning", multi_line=True, timeout=8000,
+                )
+                return
+            dialog.close()
+            ui.notify("Proposal archived as a read-only record.", type="positive")
+            ui.navigate.reload()
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+            ui.button("Archive", icon="inventory_2", on_click=confirm).props(
+                "color=primary"
+            )
+    dialog.open()
 
 
 # Sentinel for "do not modify this field" — distinguishes from explicit None
@@ -2478,6 +3004,7 @@ def _open_edit_cost_basis_dialog(
                 status.set_text("Saving cost basis to data/pricing/payment_systems.json…")
                 status.classes(replace="text-sm italic text-blue-700")
                 update_payment_cost_basis(
+                    proposal_id=proposal_id,
                     sponsor_acquirer_fee_bps=float(sponsor_in.value or 0),
                     gateway_per_txn_usd=float(gateway_in.value or 0),
                     annualized_pci_compliance_usd=float(pci_in.value or 0),
@@ -2491,8 +3018,13 @@ def _open_edit_cost_basis_dialog(
                 )
                 if ok:
                     ui.notify(
-                        "Cost basis saved + profit math recomputed.",
+                        "Cost basis saved and this proposal's profit math "
+                        "recomputed. Rerun Payment Cost Reviewer; other "
+                        "payment proposals must refresh their profit math "
+                        "before submission.",
                         type="positive",
+                        multi_line=True,
+                        timeout=8000,
                     )
                 else:
                     ui.notify(
@@ -2754,9 +3286,12 @@ def _render_cost_pricing_headline(
         ui.label(
             "Three risk-adjusted policy scenarios plus a Custom "
             "slider for free-form what-if exploration. Click a card "
-            "to see its detail below. The MEDIUM scenario is the "
-            "default proposed price; the Custom slider lets you edit "
-            "labor lines, ODCs, and bid posture without persisting."
+            "to see its detail below. The selected LOW/MEDIUM/HIGH "
+            "scenario is what the Cost Writer will use. The Custom "
+            "view lets you edit labor lines and ODCs, then save those "
+            "edits back into the policy scenarios before drafting. "
+            "Changing the proposed scenario or saved build requires a "
+            "fresh Cost Reviewer run before submission."
         ).classes("text-xs opacity-70 pb-2")
 
         with ui.row().classes("w-full gap-3 flex-wrap"):
@@ -3460,10 +3995,8 @@ def _render_payment_pricing_model_selector(
                 f"below still shows rates for the agent's "
                 f"recommendation — click 'Re-run scan with "
                 f"{model_id} focus' to get rates aligned with your "
-                f"selection.",
-                type="info",
-                multi_line=True,
-                timeout=8000,
+                f"selection, then rerun Payment Cost Reviewer.",
+                type="info", multi_line=True, timeout=8000,
             )
         # Trigger a refresh of the cost tab so the chip + banner
         # state updates without requiring a manual reload.
@@ -5785,6 +6318,13 @@ _KB_STATUS_VISUAL = {
 @ui.page("/kb")
 def knowledge_base() -> None:
     with page_frame("Knowledge Base"):
+        if get_settings().is_demo:
+            _empty_state(
+                "Knowledge Base management is locked in the curated demo workspace.",
+                icon="lock",
+            )
+            return
+
         with ui.row().classes("items-center justify-between w-full"):
             with ui.column().classes("gap-0"):
                 ui.label("Knowledge Base").classes("text-xl font-semibold")
@@ -5819,6 +6359,8 @@ def _render_kb_documents_panel() -> None:
         ui.label("Add documents").classes("text-base font-medium")
 
         staged_list = ui.column().classes("w-full")
+        staged_list.props["role"] = "list"
+        staged_list.props["aria-label"] = "Staged KB files"
 
         def render_staged() -> None:
             staged_list.clear()
@@ -5828,7 +6370,10 @@ def _render_kb_documents_panel() -> None:
                     return
                 for name, info in staged.items():
                     size_kb = len(info["data"]) / 1024
-                    with ui.row().classes("items-center gap-2 w-full"):
+                    staged_row = ui.row().classes("items-center gap-2 w-full")
+                    staged_row.props["role"] = "listitem"
+                    staged_row.props["aria-label"] = f"Staged KB file {name}"
+                    with staged_row:
                         ui.icon("description")
                         with ui.column().classes("gap-0 flex-1"):
                             ui.label(name).classes("text-sm")
@@ -5855,10 +6400,13 @@ def _render_kb_documents_panel() -> None:
                                     f"text-xs italic {conf_color}"
                                 )
                         ui.label(f"{size_kb:.1f} KB").classes("text-xs opacity-60")
-                        ui.button(
+                        remove_button = ui.button(
                             icon="close",
                             on_click=lambda n=name: (staged.pop(n, None), render_staged()),
                         ).props("flat dense")
+                        remove_button.props["aria-label"] = (
+                            f"Remove staged KB file {name}"
+                        )
 
         render_staged()
 
@@ -6283,8 +6831,14 @@ def _render_kb_documents_panel() -> None:
                         _render_kb_doc_row(s, pending_by_doc.get(s["id"], 0))
 
     def _render_kb_doc_row(s: dict, n_pending: int) -> None:
-        icon, color_cls = _KB_STATUS_VISUAL.get(s["status"], ("help_outline", "text-slate-500"))
-        with ui.row().classes("items-center w-full gap-3 py-1 px-2 rounded hover:bg-slate-50"):
+        icon, color_cls = _KB_STATUS_VISUAL.get(
+            s["status"], ("help_outline", "text-slate-500")
+        )
+        document_row = ui.row().classes(
+            "items-center w-full gap-3 py-1 px-2 rounded hover:bg-slate-50"
+        )
+        document_row.props["data-kb-document-id"] = str(s["id"])
+        with document_row:
             ui.icon(icon).classes(color_cls)
             with ui.column().classes("gap-0 flex-1"):
                 ui.label(s["filename"]).classes("font-medium text-sm")
@@ -6302,10 +6856,11 @@ def _render_kb_documents_panel() -> None:
                     on_click=lambda: ui.navigate.to("/config?tab=suggestions"),
                 ).props("color=amber-3 text-color=black clickable").classes("cursor-pointer")
             ui.label(f"#{s['id']}").classes("text-xs opacity-50 font-mono")
-            ui.button(
+            delete_button = ui.button(
                 icon="delete_outline",
                 on_click=lambda e, did=s["id"], fn=s["filename"]: _confirm_delete_kb(did, fn),
             ).props("flat dense color=negative")
+            delete_button.props["aria-label"] = f"Delete KB document #{s['id']}"
 
     refresh_list()
     # Slow background refresh so ingestion progress shows up without manual reload.
@@ -6329,6 +6884,13 @@ def config_page(request: Request) -> None:
     if tab not in {"profile", "suggestions", "decisions", "pricing", "models", "costs"}:
         tab = "profile"
     with page_frame("Configuration"):
+        if get_settings().is_demo:
+            _empty_state(
+                "Configuration is locked in the curated demo workspace.",
+                icon="lock",
+            )
+            return
+
         with ui.tabs().classes("w-full") as tabs:
             ui.tab("profile", label="Company Profile", icon="business")
             ui.tab("suggestions", label="Pending Profile Updates", icon="rule_folder")
@@ -6389,7 +6951,8 @@ def config_page(request: Request) -> None:
                     ui.table(columns=columns, rows=rows, row_key="title").classes("w-full")
 
                 ui.label(
-                    "Edit data/company_profile.json directly and bump _meta.version. "
+                    "Edit company_profile.json in the active data workspace and "
+                    "bump _meta.version. "
                     "Changes take effect after restart (or call reload_company_profile())."
                 ).classes("text-xs opacity-60 pt-3")
 
@@ -6401,18 +6964,24 @@ def config_page(request: Request) -> None:
 
             with ui.tab_panel("pricing"):
                 _empty_state(
-                    "internal_pricing_rules.json — overhead, G&A, fee, sub markup. "
-                    "Define before Weeks 12–13.",
+                    "Pricing rules are active and loaded from "
+                    "internal_pricing_rules.json in the active data workspace. "
+                    "This view is read-only; "
+                    "edit that file and restart the app to apply changes.",
                     icon="payments",
                 )
             with ui.tab_panel("models"):
                 _empty_state(
-                    "Per-agent model assignment lives in .env. Surface here in Phase 2.",
+                    "Per-agent model assignments are active and loaded from .env, "
+                    "with defaults in app/config.py. This view is read-only; restart "
+                    "the app after changing .env.",
                     icon="psychology",
                 )
             with ui.tab_panel("costs"):
                 _empty_state(
-                    "Per-run / monthly cost caps live in .env. Surface dashboard here in Phase 1 hardening.",
+                    "Per-run and monthly cost-cap values are loaded from .env. "
+                    "They are advisory and are not currently enforced. Proposal-level "
+                    "LLM spend is available in each proposal's Spend tab.",
                     icon="account_balance_wallet",
                 )
 
@@ -6675,9 +7244,13 @@ def _render_decisions_tab() -> None:
                                 ui.button("Delete", icon="delete", on_click=go).props("color=negative")
                         dlg.open()
 
-                    ui.button(icon="delete_outline", on_click=_confirm_delete).props(
-                        "flat dense color=negative"
-                    )
+                    delete_button = ui.button(
+                        icon="delete_outline", on_click=_confirm_delete
+                    ).props("flat dense color=negative")
+                    delete_label = f"Delete decision {d.get('id', '?')}"
+                    if d.get("topic"):
+                        delete_label += f": {d['topic']}"
+                    delete_button.props["aria-label"] = delete_label
 
     with container:
         render()
@@ -6739,7 +7312,8 @@ def _render_pending_suggestions_tab() -> None:
                 return
 
             ui.label(
-                "Approving writes back to data/company_profile.json with a version bump. "
+                "Approving writes back to company_profile.json in the active "
+                "data workspace with a version bump. "
                 "Rejecting just dismisses; the source KB document is unchanged either way."
             ).classes("text-xs opacity-60")
 
@@ -6814,7 +7388,11 @@ def admin() -> None:
                 ui.label(get_profile_version()).classes("text-3xl font-semibold")
 
         ui.separator()
-        ui.label("Cost dashboard, run history, and error log surface here in Weeks 14–15.").classes(
+        ui.label(
+            "This is a read-only installation summary. Open a proposal's Run "
+            "Progress page for run history and errors, or its Spend tab for "
+            "LLM cost details."
+        ).classes(
             "text-sm opacity-60"
         )
 

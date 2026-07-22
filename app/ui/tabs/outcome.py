@@ -44,6 +44,7 @@ def _render_outcome_panel(
     proposal_id: int,
     *,
     on_state_change: Any = None,
+    read_only: bool = False,
 ) -> None:
     """Render the Outcome panel for a proposal.
 
@@ -51,6 +52,7 @@ def _render_outcome_panel(
         proposal_id: the proposal whose outcome is surfaced.
         on_state_change: optional callable to refresh outer chrome (tab
             badges, banners) when the outcome row changes.
+        read_only: render the outcome record without an edit action.
 
     The panel is a single ui.card with:
       - Current outcome chip (color per `_OUTCOME_CHIP_COLOR`).
@@ -135,7 +137,7 @@ def _render_outcome_panel(
             if summary_bits:
                 ui.label(" · ".join(summary_bits)).classes("text-sm opacity-70")
 
-            ui.button(
+            edit_button = ui.button(
                 "Edit outcome",
                 icon="edit",
                 on_click=lambda: _open_edit_dialog(
@@ -145,6 +147,8 @@ def _render_outcome_panel(
                     on_state_change=on_state_change,
                 ),
             ).props("flat color=primary").classes("ml-auto")
+            if read_only:
+                edit_button.disable()
 
         # Per-factor scoring breakdown (read-only summary when set).
         scores = snapshot["factor_scores"] or []

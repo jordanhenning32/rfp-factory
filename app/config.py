@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -7,12 +8,67 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _resolve_data_dir(raw_value: str | None = None) -> Path:
+    """Resolve the active data workspace independently of the process cwd."""
+    configured = raw_value if raw_value is not None else os.getenv("RFP_DATA_DIR")
+    if not configured or not configured.strip():
+        return PROJECT_ROOT / "data"
+
+    candidate = Path(configured.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    return candidate.resolve()
+
+
+DATA_DIR = _resolve_data_dir()
 KB_DIR = DATA_DIR / "kb_documents"
 RFP_PACKAGES_DIR = DATA_DIR / "rfp_packages"
 OUTPUTS_DIR = DATA_DIR / "outputs"
 BACKUPS_DIR = DATA_DIR / "backups"
 COMPANY_PROFILE_PATH = DATA_DIR / "company_profile.json"
+
+_INSECURE_STORAGE_SECRETS = {
+    "dev-only-change-me",
+    "change-me-to-a-random-string",
+}
+
+
+def _database_path_for_sqlite(database_url: str) -> Path | None:
+    """Resolve a file-backed SQLite URL without creating the database."""
+    from sqlalchemy.engine import make_url
+
+    url = make_url(database_url)
+    if url.get_backend_name() != "sqlite" or not url.database:
+        return None
+    if url.database == ":memory:":
+        return None
+    path = Path(url.database).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _require_isolated_database(database_url: str, data_dir: Path) -> None:
+    """Fail closed when an isolated file workspace points at another DB.
+
+    ``RFP_DATA_DIR`` is used by tests, demos, and operators specifically to
+    isolate a workspace.  Mixing its attachments/profile files with a database
+    from the canonical workspace is more dangerous than refusing startup.
+    """
+    try:
+        actual = _database_path_for_sqlite(database_url)
+    except Exception as exc:
+        raise ValueError(
+            "RFP_DATA_DIR requires a valid file-backed SQLite DATABASE_URL"
+        ) from exc
+    expected = (data_dir / "sqlite.db").resolve()
+    if actual is None or os.path.normcase(str(actual)) != os.path.normcase(str(expected)):
+        raise ValueError(
+            "RFP_DATA_DIR requires DATABASE_URL to point to sqlite.db inside "
+            "that same workspace"
+        )
 
 
 class Settings(BaseSettings):
@@ -23,7 +79,10 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
-    app_host: str = "0.0.0.0"
+    # Local desktop product: do not expose proposal data to the LAN by
+    # default. Deployments that intentionally add authentication/reverse
+    # proxying can opt into a broader bind explicitly.
+    app_host: str = "127.0.0.1"
     app_port: int = 8000
     app_storage_secret: str = "dev-only-change-me"
 
@@ -42,11 +101,17 @@ class Settings(BaseSettings):
         env = (self.app_env or "").strip().lower()
         secret = (self.app_storage_secret or "").strip()
         if env not in {"development", "dev", "local", "test", "testing"} and (
-            not secret or secret == "dev-only-change-me"
+            not secret or secret in _INSECURE_STORAGE_SECRETS
         ):
             raise ValueError(
                 "APP_STORAGE_SECRET must be set to a non-default value outside development/test."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_workspace_isolation(self) -> Settings:
+        if os.getenv("RFP_DATA_DIR", "").strip():
+            _require_isolated_database(self.database_url, DATA_DIR)
         return self
 
     @property
@@ -152,8 +217,9 @@ class Settings(BaseSettings):
     # than speed. Default = Sonnet 4.6. The setting is exposed as a
     # knob for quick-eval scans where the user wants intake-as-fast-
     # as-possible — set model_compliance_matrix=claude-haiku-4-5-20251001
-    # in .env to swap in. The Haiku validator pass + deterministic
-    # truncation repair sit downstream as safety nets either way.
+    # in .env to swap in. Independent Gemini review, bounded Haiku leaf
+    # fallback, and deterministic truncation repair sit downstream as safety
+    # nets either way.
     model_compliance_matrix: str = "claude-sonnet-4-6"
     # Compliance Matrix VALIDATOR — runs after the drafter to catch
     # type/category drift. Cross-provider on purpose: Sonnet drafts,
@@ -163,6 +229,12 @@ class Settings(BaseSettings):
     # over-flagging is bounded — worst case is more visible warnings,
     # not corrupted data. Cost bump vs Haiku is ~$0.50/intake.
     model_compliance_validator: str = "gemini-2.5-pro"
+    # Leaf fallback only. The validator first retries a failed Gemini batch
+    # in smaller pieces; Haiku is used only if that bounded recovery still
+    # cannot produce a valid structured response. Any fallback use is stored
+    # and surfaced as a degraded independent-review outcome because both the
+    # extractor and fallback then come from Anthropic.
+    model_compliance_validator_fallback: str = "claude-haiku-4-5-20251001"
     # Cost Reviewer — adversarial fact-check of the Cost Analyst's
     # output. Looks for missed scope, unrealistic hours, margin
     # pressure vs market, wage-band misalignment, phase gaps,
@@ -310,6 +382,10 @@ class Settings(BaseSettings):
     def is_dev(self) -> bool:
         return self.app_env.lower() in ("development", "dev", "local")
 
+    @property
+    def is_demo(self) -> bool:
+        return self.app_env.lower() == "demo"
+
     def model_writer_team_for_pass(self, pass_num: int | None) -> str:
         """Pick the writer-revision model for a given auto-loop pass.
 
@@ -340,6 +416,7 @@ def ensure_data_dirs() -> None:
 
 __all__ = [
     "PROJECT_ROOT",
+    "_resolve_data_dir",
     "DATA_DIR",
     "KB_DIR",
     "RFP_PACKAGES_DIR",

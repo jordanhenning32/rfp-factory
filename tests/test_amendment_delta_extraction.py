@@ -64,7 +64,11 @@ def test_delta_mode_returns_populated_delta_fields(monkeypatch, inmemory_db):
     )
 
     result = extract_compliance_items(
-        document_text="Amendment 1 changes the page limit and adds a new requirement.",
+        document_text=(
+            "--- Page 1 ---\n"
+            "The contractor shall submit weekly reports.\n"
+            "Page limit raised from 25 pages to 30 pages."
+        ),
         filename="Amendment_0001.pdf",
         proposal_id=1,
         existing_items=[
@@ -161,8 +165,9 @@ def test_legacy_mode_returns_items_field(monkeypatch, inmemory_db):
 
     # Use --- Page N --- marker so the small-doc path runs cleanly.
     doc_text = (
-        "--- Page 1 ---\n"
+        "--- Page 5 ---\n"
         "The contractor shall provide weekly status reports.\n"
+        "--- Page 7 ---\n"
         "Proposals must be submitted by 5 PM EST."
     )
 

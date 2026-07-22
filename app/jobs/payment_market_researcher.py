@@ -43,6 +43,7 @@ import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 
 from app.agents.payment_market_consolidator import (
     consolidate_payment_market_research,
@@ -60,10 +61,22 @@ from app.agents.payment_market_researcher_claude import (
 )
 from app.db.session import session_scope
 from app.models import Proposal
+from app.services.proposal_access import (
+    acquire_proposal_write_fence,
+    ensure_proposal_mutable,
+    proposal_write_lock,
+    require_proposal_mutable,
+)
+from app.services.review_freshness import (
+    current_payment_cost_basis_provenance,
+    payment_cost_basis_provenance,
+    stamp_payment_market_scan_provenance,
+)
 from app.services.service_line import (
     SERVICE_LINE_PAYMENT_SYSTEMS,
     get_service_line,
     load_payment_systems_pricing,
+    payment_cost_basis_lock,
 )
 from app.services.stages import record_stage as _set_stage
 
@@ -146,6 +159,9 @@ def run_payment_market_research(
 ) -> None:
     """Sync entry point. Builds inputs, runs the agent, computes
     profit math, persists. All exceptions surface via stage banner."""
+    require_proposal_mutable(
+        proposal_id, operation="run payment market research",
+    )
     log.info(
         "payment_market_researcher starting for proposal %d",
         proposal_id,
@@ -167,6 +183,7 @@ def run_payment_market_research(
             _set_stage(
                 proposal_id,
                 f"Payment Market Researcher: proposal {proposal_id} not found.",
+                status="failed",
             )
             return
 
@@ -243,11 +260,30 @@ def run_payment_market_research(
             pass_b=pass_b,
         )
 
-        # Compute profit math from the consolidated pricing
-        # recommendation + volume estimate + our cost basis.
-        result.profit_math = _compute_profit_math(result)
-
-        _persist_result(proposal_id, result)
+        # Compute and stamp from the SAME immutable cost-basis snapshot.
+        # If an operator changes the shared file before commit, retry the
+        # cheap deterministic math once; never label old math with a new hash.
+        persisted = False
+        for _attempt in range(2):
+            with payment_cost_basis_lock():
+                pricing_snapshot = deepcopy(load_payment_systems_pricing())
+            used_provenance = payment_cost_basis_provenance(pricing_snapshot)
+            result.profit_math = _compute_profit_math(
+                result,
+                pricing_data=pricing_snapshot,
+            )
+            if _persist_result(
+                proposal_id,
+                result,
+                cost_basis_provenance=used_provenance,
+            ):
+                persisted = True
+                break
+        if not persisted:
+            raise RuntimeError(
+                "Payment cost basis changed repeatedly while profit math "
+                "was being committed; rerun Payment Market Research."
+            )
 
         _set_stage(
             proposal_id,
@@ -267,6 +303,7 @@ def run_payment_market_research(
         _set_stage(
             proposal_id,
             f"Payment Market Researcher: failed — {exc}",
+            status="failed",
         )
 
 
@@ -353,21 +390,30 @@ def _build_quadratic_summary() -> str:
 # ---- Profit math --------------------------------------------------------
 
 
-def compute_profit_math(result) -> ProfitMath:
+def compute_profit_math(
+    result,
+    *,
+    pricing_data: dict | None = None,
+) -> ProfitMath:
     """Public alias of _compute_profit_math so callers outside the
     orchestrator (e.g. service helpers re-running profit math after
     a cost-basis edit) can reuse the math without spawning a new
     market-research run."""
-    return _compute_profit_math(result)
+    return _compute_profit_math(result, pricing_data=pricing_data)
 
 
-def _compute_profit_math(result) -> ProfitMath:
+def _compute_profit_math(
+    result,
+    *,
+    pricing_data: dict | None = None,
+) -> ProfitMath:
     """Compute revenue (rate × volume) − internal costs from the
     agent's pricing recommendation + volume estimate + our cost basis.
     All branches degrade gracefully — missing inputs produce None
     fields rather than zeros, so the writer can disclose what's
     missing instead of asserting fake numbers."""
-    pricing_data = load_payment_systems_pricing()
+    if pricing_data is None:
+        pricing_data = load_payment_systems_pricing()
     cost_basis = (pricing_data.get("our_cost_basis") or {}).copy()
     # Layer defaults under any user-provided values.
     for k, default in _DEFAULT_COST_BASIS.items():
@@ -481,16 +527,42 @@ def _compute_profit_math(result) -> ProfitMath:
 # ---- Persistence --------------------------------------------------------
 
 
-def _persist_result(proposal_id: int, result) -> None:
+def _persist_result(
+    proposal_id: int,
+    result,
+    *,
+    cost_basis_provenance: dict[str, str] | None = None,
+) -> bool:
     """Serialize the result and write to proposals.payment_market_
     scan_json. Replaces any prior scan in full — re-running the
     researcher overwrites the prior result rather than merging."""
-    payload = json.dumps(result.to_json_dict(), default=str, indent=2)
-    with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
-        if p is None:
-            return
-        p.payment_market_scan_json = payload
+    with proposal_write_lock(proposal_id):
+        with payment_cost_basis_lock():
+            current_provenance = current_payment_cost_basis_provenance()
+            used_provenance = (
+                cost_basis_provenance or current_provenance
+            )
+            if used_provenance != current_provenance:
+                return False
+            payload = json.dumps(
+                stamp_payment_market_scan_provenance(
+                    result.to_json_dict(),
+                    provenance=used_provenance,
+                ),
+                default=str,
+                indent=2,
+            )
+            with session_scope() as db:
+                acquire_proposal_write_fence(db, proposal_id)
+                p = ensure_proposal_mutable(
+                    db,
+                    proposal_id,
+                    operation="persist payment market research",
+                )
+                if p is None:
+                    return False
+                p.payment_market_scan_json = payload
+    return True
 
 
 __all__ = [

@@ -15,6 +15,11 @@ from dataclasses import dataclass
 
 from app.db.session import session_scope
 from app.models import ProposalSection
+from app.services.cancellation import (
+    require_active_section_owner,
+    section_write_lease,
+)
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -45,9 +50,10 @@ def replace_outline(proposal_id: int, sections: Iterable[OutlineSection]) -> int
     """
     written = 0
     with session_scope() as db:
-        db.query(ProposalSection).filter(ProposalSection.proposal_id == proposal_id).delete(
-            synchronize_session=False
-        )
+        ensure_proposal_mutable(db, proposal_id, operation="replace outline")
+        db.query(ProposalSection).filter(
+            ProposalSection.proposal_id == proposal_id
+        ).delete(synchronize_session=False)
 
         for s in sections:
             db.add(
@@ -89,6 +95,9 @@ def mark_compliance_item_outline_excluded(
     from app.models import ComplianceMatrixItem
 
     with session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="change outline exclusions",
+        )
         # Active row only — after an amendment supersedes a requirement,
         # two rows share the same (proposal_id, requirement_id); without
         # the status filter, scalar_one_or_none() raises MultipleResultsFound.
@@ -286,6 +295,9 @@ def assign_compliance_item_to_section(
         sec = db.get(ProposalSection, section_pk)
         if sec is None:
             return False
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="change outline assignments",
+        )
         current = list(sec.compliance_items_addressed_json or [])
         if req_id in current:
             return False
@@ -310,6 +322,10 @@ def persist_section_draft(
         if sec is None:
             log.warning("persist_section_draft: section pk=%d not found", proposal_section_pk)
             return
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="persist section draft",
+        )
+        require_active_section_owner(sec.proposal_id, proposal_section_pk)
         sec.draft_text_markdown = draft_text_markdown
         sec.citations_json = citations
         sec.needs_human_placeholders_json = needs_human_placeholders
@@ -321,10 +337,20 @@ def clear_section_draft(proposal_section_pk: int) -> None:
     """Wipe the drafted content for one section so it can be regenerated.
     Leaves the outline metadata (title, brief, compliance assignments) intact.
     """
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return
+        _clear_section_draft_owned(proposal_section_pk)
+
+
+def _clear_section_draft_owned(proposal_section_pk: int) -> None:
     with session_scope() as db:
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None:
             return
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="clear section draft",
+        )
         sec.draft_text_markdown = None
         sec.citations_json = []
         sec.needs_human_placeholders_json = []
@@ -343,6 +369,9 @@ def set_section_cost_deferred(proposal_section_pk: int, value: bool) -> bool:
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None:
             return False
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="change section cost handling",
+        )
         sec.requires_cost_analysis = bool(value)
         log.info(
             "set_section_cost_deferred: section pk=%d -> requires_cost_analysis=%s",
@@ -365,6 +394,9 @@ def set_section_excluded_from_draft(proposal_section_pk: int, value: bool) -> bo
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None:
             return False
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="change draft exclusions",
+        )
         sec.excluded_from_draft = bool(value)
         log.info(
             "set_section_excluded_from_draft: section pk=%d -> excluded_from_draft=%s",
@@ -387,10 +419,23 @@ def save_manual_edit(proposal_section_pk: int, new_markdown: str) -> bool:
 
     Returns True if the section exists and was updated.
     """
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return False
+        return _save_manual_edit_owned(proposal_section_pk, new_markdown)
+
+
+def _save_manual_edit_owned(
+    proposal_section_pk: int,
+    new_markdown: str,
+) -> bool:
     with session_scope() as db:
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None:
             return False
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="edit section draft",
+        )
         sec.draft_text_markdown = new_markdown
         sec.current_revision_number = (sec.current_revision_number or 0) + 1
         log.info(

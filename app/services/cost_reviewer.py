@@ -6,9 +6,10 @@ multiple scenarios get one row per affected scenario — keeps the
 schema simple and lets the UI surface findings on each scenario's
 detail panel.
 
-Re-running the reviewer REPLACES existing findings for the
-proposal. Each scenario's CASCADE delete via PricingPackage
-relationship handles cleanup if the cost build is regenerated.
+Re-running the reviewer replaces findings that disappeared while carrying
+human triage forward for logically identical findings. Each scenario's
+CASCADE delete via PricingPackage relationship handles cleanup if the cost
+build is regenerated.
 """
 
 from __future__ import annotations
@@ -21,8 +22,52 @@ from sqlalchemy import select
 from app.agents.cost_reviewer import CostReviewResult
 from app.db.session import session_scope
 from app.models import CostReviewFinding, PricingPackage, Proposal
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
+
+
+_VALID_USER_ACTIONS = {"pending", "accepted", "rejected"}
+
+
+def _normalize_identity_part(value: Any) -> str:
+    """Normalize harmless model-output formatting drift for identity checks."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _logical_finding_key(
+    severity: Any,
+    category: Any,
+    finding_text: Any,
+) -> tuple[str, str, str]:
+    """Match the UI's logical finding identity, with text normalization."""
+    return (
+        _normalize_identity_part(severity),
+        _normalize_identity_part(category),
+        _normalize_identity_part(finding_text),
+    )
+
+
+def _triage_state(row: CostReviewFinding) -> dict[str, Any]:
+    action = str(row.user_action or "pending").strip().lower()
+    if action not in _VALID_USER_ACTIONS:
+        action = "pending"
+    return {
+        "user_action": action,
+        "user_note": row.user_note,
+        "auto_actioned": bool(row.auto_actioned and action == "accepted"),
+    }
+
+
+def _triage_priority(state: dict[str, Any]) -> tuple[int, int, int]:
+    """Prefer explicit human triage if legacy scenario rows disagree."""
+    actioned = state["user_action"] in {"accepted", "rejected"}
+    human_actioned = actioned and not state["auto_actioned"]
+    return (
+        int(human_actioned),
+        int(actioned),
+        int(bool(state["user_note"])),
+    )
 
 
 def upsert_cost_review_findings(
@@ -30,14 +75,21 @@ def upsert_cost_review_findings(
     proposal_id: int,
     result: CostReviewResult,
 ) -> int:
-    """Replace existing cost-review findings for the proposal with
-    the new result. Returns the number of CostReviewFinding rows
-    written (one per finding × affected scenario).
+    """Replace stale cost-review findings while preserving matching triage.
+
+    Returns the number of CostReviewFinding rows written (one per finding ×
+    affected scenario). A logical finding is identified the same way the UI
+    groups it: severity + category + finding text, normalized for harmless
+    whitespace/case drift. Scenario membership and generated row IDs are not
+    identity, so accepted/rejected state and user notes survive those changes.
 
     Findings affecting multiple scenarios are written as multiple
     rows so each scenario's detail panel can surface its own
     findings without joining across pricing packages."""
     with session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="replace cost review findings",
+        )
         # Pull the proposal's pricing packages so we can look up
         # PricingPackage.id by scenario name.
         pkgs = (
@@ -57,19 +109,36 @@ def upsert_cost_review_findings(
             return 0
         by_scenario_id: dict[str, int] = {p.scenario: p.id for p in pkgs}
 
-        # Clear existing findings for this proposal (across all
-        # scenarios). Cascade via FK doesn't help here because we
-        # want to preserve PricingPackage rows; just delete the
-        # findings directly.
-        existing = (
-            db.execute(
-                select(CostReviewFinding).where(
-                    CostReviewFinding.pricing_package_id.in_([p.id for p in pkgs])
+        # Snapshot triage before replacing the rows. Scenario rows belonging
+        # to one logical finding normally have identical state because the UI
+        # updates them together. If legacy rows disagree, prefer an explicit
+        # human action over an auto-action or pending state.
+        existing = db.execute(
+            select(CostReviewFinding).where(
+                CostReviewFinding.pricing_package_id.in_(
+                    [p.id for p in pkgs]
                 )
             )
-            .scalars()
-            .all()
-        )
+            .order_by(CostReviewFinding.id)
+        ).scalars().all()
+        triage_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for ex in existing:
+            key = _logical_finding_key(
+                ex.severity,
+                ex.category,
+                ex.finding_text,
+            )
+            candidate = _triage_state(ex)
+            current = triage_by_key.get(key)
+            if (
+                current is None
+                or _triage_priority(candidate) > _triage_priority(current)
+            ):
+                triage_by_key[key] = candidate
+
+        # Clear existing findings across all scenarios. Findings absent from
+        # the new result intentionally disappear; matching state is applied to
+        # the replacement rows below.
         for ex in existing:
             db.delete(ex)
         if existing:
@@ -95,6 +164,18 @@ def upsert_cost_review_findings(
                 if f.subject and f.subject.strip()
                 else f.finding_text
             )
+            triage = triage_by_key.get(
+                _logical_finding_key(
+                    f.severity,
+                    f.category,
+                    persisted_text,
+                ),
+                {
+                    "user_action": "pending",
+                    "user_note": None,
+                    "auto_actioned": False,
+                },
+            )
 
             for scenario in f.scenarios_affected:
                 pkg_id = by_scenario_id.get(scenario)
@@ -106,18 +187,20 @@ def upsert_cost_review_findings(
                         f.subject,
                     )
                     continue
-                db.add(
-                    CostReviewFinding(
-                        pricing_package_id=pkg_id,
-                        finding_text=persisted_text,
-                        severity=f.severity,
-                        category=f.category,
-                        alternative_scenarios_json=alternatives_persisted,
-                        recommended_change=(f.recommended_change.strip() if f.recommended_change else None),
-                        user_action="pending",
-                        user_note=None,
-                    )
-                )
+                db.add(CostReviewFinding(
+                    pricing_package_id=pkg_id,
+                    finding_text=persisted_text,
+                    severity=f.severity,
+                    category=f.category,
+                    alternative_scenarios_json=alternatives_persisted,
+                    recommended_change=(
+                        f.recommended_change.strip()
+                        if f.recommended_change else None
+                    ),
+                    user_action=triage["user_action"],
+                    user_note=triage["user_note"],
+                    auto_actioned=triage["auto_actioned"],
+                ))
                 n_written += 1
 
         db.flush()
@@ -198,9 +281,25 @@ def update_cost_review_finding_action(
     if user_action not in ("pending", "accepted", "rejected"):
         raise ValueError(f"user_action must be pending/accepted/rejected; got {user_action!r}")
     with session_scope() as db:
-        rows = (
-            db.execute(select(CostReviewFinding).where(CostReviewFinding.id.in_(finding_ids))).scalars().all()
+        rows = db.execute(
+            select(CostReviewFinding).where(
+                CostReviewFinding.id.in_(finding_ids)
+            )
+        ).scalars().all()
+        proposal_ids = set(
+            db.execute(
+                select(PricingPackage.proposal_id)
+                .join(
+                    CostReviewFinding,
+                    CostReviewFinding.pricing_package_id == PricingPackage.id,
+                )
+                .where(CostReviewFinding.id.in_(finding_ids))
+            ).scalars().all()
         )
+        for proposal_id in proposal_ids:
+            ensure_proposal_mutable(
+                db, proposal_id, operation="triage cost review findings",
+            )
         for r in rows:
             r.user_action = user_action
             # User has reviewed the row — clear the AUTO marker.
@@ -242,16 +341,17 @@ def auto_accept_consensus_findings(proposal_id: int) -> int:
     minority_prefix = "[Single-reviewer flag from "
     high_severities = {"CRITICAL", "MAJOR"}
     with session_scope() as db:
-        rows = (
-            db.execute(
-                select(CostReviewFinding)
-                .join(
-                    PricingPackage,
-                    CostReviewFinding.pricing_package_id == PricingPackage.id,
-                )
-                .where(PricingPackage.proposal_id == proposal_id)
-                .where(CostReviewFinding.user_action == "pending")
+        ensure_proposal_mutable(
+            db, proposal_id, operation="triage cost review findings",
+        )
+        rows = db.execute(
+            select(CostReviewFinding)
+            .join(
+                PricingPackage,
+                CostReviewFinding.pricing_package_id == PricingPackage.id,
             )
+            .where(PricingPackage.proposal_id == proposal_id)
+            .where(CostReviewFinding.user_action == "pending")
             .scalars()
             .all()
         )
@@ -287,7 +387,9 @@ def save_cost_review_strategy(
     from datetime import datetime as _dt
 
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="save cost review strategy",
+        )
         if p is None:
             log.warning(
                 "save_cost_review_strategy: proposal %d not found",

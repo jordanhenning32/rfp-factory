@@ -20,13 +20,22 @@ import re
 import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 
+from app.agents.compliance_completeness import (
+    ComplianceCompletenessReport,
+    MissingRequirementCandidate,
+    audit_compliance_completeness,
+)
 from app.agents.compliance_matrix import (
     ExtractedComplianceItem,
     extract_compliance_items,
 )
-from app.agents.compliance_validator import validate_compliance_items
+from app.agents.compliance_validator import (
+    ComplianceValidationReport,
+    validate_compliance_items_report,
+)
 from app.agents.section_m_extractor import extract_evaluation_criteria
 from app.agents.shortfall_strategist import (
     ShortfallItem,
@@ -49,6 +58,7 @@ from app.core.teaming_partners import get_teaming_partners
 from app.db.session import session_scope
 from app.models import (
     ComplianceMatrixItem,
+    CostMatrixArtifact,
     GapAnalysis,
     Proposal,
     RfpPackageDocument,
@@ -59,9 +69,14 @@ from app.services.pdf_extract import (
     extract_pdf_text,
     extract_xlsx_text,
 )
+from app.services.proposal_access import (
+    acquire_proposal_write_fence,
+    ensure_proposal_mutable,
+    proposal_write_lock,
+    require_proposal_mutable,
+)
 
 log = logging.getLogger(__name__)
-
 
 # Stage-message logger lives in app.services.stages so all four job
 # modules share one FK-safe implementation. Aliased to _set_stage so
@@ -108,10 +123,58 @@ def _extract_text_for_intake(storage_path: str, filename: str) -> tuple[str, int
     raise ValueError(f"unsupported file type for intake: {suffix or filename!r}")
 
 
+def _has_meaningful_extracted_text(text: str | None) -> bool:
+    """Return whether extraction produced actual document content.
+
+    Page/sheet markers alone are not useful input. In particular, a scanned
+    PDF without OCR used to look non-empty because its page markers remained.
+    """
+    if not text:
+        return False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"---\s*Page\s+\d+\s*---", line, flags=re.IGNORECASE):
+            continue
+        if re.fullmatch(r"\[Sheet:\s*.*\]", line, flags=re.IGNORECASE):
+            continue
+        if any(ch.isalnum() for ch in line):
+            return True
+    return False
+
+
+def _set_document_review_disposition(
+    document: RfpPackageDocument,
+    *,
+    status: str,
+    reason: str,
+    requires_manual_review: bool,
+) -> None:
+    """Persist an extraction-stage disposition in the caller's transaction."""
+
+    structure = dict(document.structure_json or {})
+    structure["requirements_review"] = {
+        "schema_version": 1,
+        "status": status,
+        "source_document_id": document.id,
+        "requires_manual_review": requires_manual_review,
+        "reason": reason,
+        "extraction": {"initial_item_count": 0, "final_item_count": 0},
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    document.structure_json = structure
+
+
 def _parse_documents(proposal_id: int) -> int:
     """Extract text from every supported doc in the package (PDF / DOCX /
-    XLSX); return count parsed."""
-    parsed = 0
+    XLSX); return the count with usable extracted content.
+
+    Already-extracted documents count on retry. Fail closed if the package
+    contains no usable text rather than advancing an empty intake.
+    """
+    usable = 0
+    failures: list[str] = []
     # Read IDs while the session is open — accessing .id on detached
     # instances triggers a refresh and raises DetachedInstanceError.
     with session_scope() as db:
@@ -123,22 +186,154 @@ def _parse_documents(proposal_id: int) -> int:
     for doc_id in doc_ids:
         with session_scope() as db:
             doc = db.get(RfpPackageDocument, doc_id)
-            if not doc or doc.extracted_text_md:
+            if not doc:
+                continue
+            artifact = (
+                db.query(CostMatrixArtifact)
+                .filter_by(source_document_id=doc.id)
+                .one_or_none()
+            )
+            matrix_mode: str | None = None
+            matrix_cache_current = False
+            if artifact is not None:
+                from app.services.cost_matrix import (
+                    ANALYSIS_VERSION,
+                    COST_MATRIX_INTAKE_POLICY_VERSION,
+                )
+
+                matrix_mode = (
+                    "visible_context"
+                    if artifact.status in {"needs_confirmation", "dismissed"}
+                    else "instructions"
+                )
+                structure = dict(doc.structure_json or {})
+                matrix_cache_current = bool(
+                    structure.get("cost_matrix_intake_analysis_version")
+                    == ANALYSIS_VERSION
+                    and structure.get("cost_matrix_intake_policy_version")
+                    == COST_MATRIX_INTAKE_POLICY_VERSION
+                    and structure.get("cost_matrix_intake_mode") == matrix_mode
+                )
+            if matrix_cache_current:
+                if _has_meaningful_extracted_text(doc.extracted_text_md):
+                    usable += 1
+                elif matrix_mode == "instructions":
+                    _set_document_review_disposition(
+                        doc,
+                        status="not_applicable",
+                        reason=(
+                            "Confirmed cost matrix contains no separate written "
+                            "requirements to extract."
+                        ),
+                        requires_manual_review=False,
+                    )
+                else:
+                    failures.append(
+                        f"{doc.filename}: no extractable text found "
+                        "(the document may be scanned; OCR is not configured)"
+                    )
+                    _set_document_review_disposition(
+                        doc,
+                        status="failed",
+                        reason=(
+                            "Source text could not be extracted. Retry with a "
+                            "text-searchable file or configure OCR."
+                        ),
+                        requires_manual_review=True,
+                    )
+                continue
+            if artifact is None and _has_meaningful_extracted_text(
+                doc.extracted_text_md
+            ):
+                usable += 1
                 continue
             try:
-                text, page_count = _extract_text_for_intake(doc.storage_path, doc.filename)
+                if artifact is not None:
+                    from app.services.cost_matrix import (
+                        extract_cost_matrix_instruction_text,
+                    )
+                    text, page_count = extract_cost_matrix_instruction_text(
+                        doc.storage_path,
+                        dict(artifact.analysis_json or {}),
+                        include_visible_context=(
+                            matrix_mode == "visible_context"
+                        ),
+                    )
+                    structure = dict(doc.structure_json or {})
+                    structure.update({
+                        "cost_matrix_intake_analysis_version": ANALYSIS_VERSION,
+                        "cost_matrix_intake_policy_version": (
+                            COST_MATRIX_INTAKE_POLICY_VERSION
+                        ),
+                        "cost_matrix_intake_mode": matrix_mode,
+                    })
+                    doc.structure_json = structure
+                    if not _has_meaningful_extracted_text(text):
+                        if matrix_mode == "instructions":
+                            # A pure confirmed pricing grid is a deliverable,
+                            # not a failed requirements source. Keep it
+                            # registered and say so explicitly in the UI.
+                            doc.extracted_text_md = None
+                            doc.page_count = 0
+                            _set_document_review_disposition(
+                                doc,
+                                status="not_applicable",
+                                reason=(
+                                    "Confirmed cost matrix contains no separate "
+                                    "written requirements to extract."
+                                ),
+                                requires_manual_review=False,
+                            )
+                            log.info(
+                                "cost matrix %s contains no separate visible instructions",
+                                doc.filename,
+                            )
+                            continue
+                        raise ValueError(
+                            "no extractable text found (the document may be scanned; "
+                            "OCR is not configured)"
+                        )
+                else:
+                    text, page_count = _extract_text_for_intake(
+                        doc.storage_path,
+                        doc.filename,
+                    )
+                if not _has_meaningful_extracted_text(text):
+                    raise ValueError(
+                        "no extractable text found (the document may be scanned; "
+                        "OCR is not configured)"
+                    )
                 doc.extracted_text_md = text
                 doc.page_count = page_count
-                parsed += 1
+                usable += 1
                 log.info(
                     "parsed %s — %d pages, %d chars",
                     doc.filename,
                     page_count,
                     len(text),
                 )
-            except Exception:
+            except Exception as exc:
+                failures.append(f"{doc.filename}: {exc}")
+                _set_document_review_disposition(
+                    doc,
+                    status="failed",
+                    reason=(
+                        "Source text could not be extracted. Retry with a "
+                        "text-searchable file or configure OCR."
+                    ),
+                    requires_manual_review=True,
+                )
                 log.exception("failed to parse %s", doc.filename)
-    return parsed
+    if usable == 0:
+        detail = "; ".join(failures) or "the package contains no readable documents"
+        raise RuntimeError(f"Intake could not parse any RFP document: {detail}")
+    if failures:
+        log.warning(
+            "proposal %d intake continuing with %d usable document(s); "
+            "%d document(s) failed: %s",
+            proposal_id, usable, len(failures), "; ".join(failures),
+        )
+    return usable
 
 
 # When the Compliance Matrix Agent occasionally confuses requirement_type
@@ -341,7 +536,11 @@ def _repair_truncated_items(
 
 
 def _persist_compliance_items(
-    proposal_id: int, source_doc: str, items: Iterable[ExtractedComplianceItem]
+    proposal_id: int,
+    source_doc: str,
+    items: Iterable[ExtractedComplianceItem],
+    *,
+    source_document_id: int | None = None,
 ) -> int:
     """Save items to the DB. De-coerce string enums to the model enum types."""
     saved = 0
@@ -377,6 +576,7 @@ def _persist_compliance_items(
                     requirement_id=item.requirement_id,
                     requirement_text=item.requirement_text,
                     source_doc=source_doc,
+                    source_document_id=source_document_id,
                     source_section=item.source_section,
                     source_page=item.source_page,
                     requirement_type=rtype,
@@ -389,66 +589,464 @@ def _persist_compliance_items(
     return saved
 
 
+def _update_document_requirements_review(
+    document_id: int,
+    state: dict,
+    *,
+    merge: bool = False,
+) -> None:
+    """Merge a sanitized review summary into document metadata."""
+
+    try:
+        with session_scope() as db:
+            document = db.get(RfpPackageDocument, document_id)
+            if document is None:
+                return
+            structure = dict(document.structure_json or {})
+            review = (
+                {**dict(structure.get("requirements_review") or {}), **state}
+                if merge
+                else dict(state)
+            )
+            review["updated_at"] = datetime.now(UTC).isoformat()
+            structure["requirements_review"] = review
+            document.structure_json = structure
+    except Exception:
+        log.exception(
+            "requirements review state could not be stored for document %d",
+            document_id,
+        )
+        raise
+
+
+def _finalize_document_requirements_review_ids(
+    document_id: int,
+    requirement_id_map: dict[str, str],
+    recovered_requirement_ids: list[str],
+) -> None:
+    """Replace temporary document IDs in durable review details.
+
+    Validation runs in parallel with document-scoped IDs.  The compliance
+    matrix receives proposal-global IDs only after all source files finish, so
+    anything shown to a user must be remapped at the same time.
+    """
+
+    try:
+        with session_scope() as db:
+            document = db.get(RfpPackageDocument, document_id)
+            if document is None:
+                return
+            structure = dict(document.structure_json or {})
+            review = dict(structure.get("requirements_review") or {})
+            if not review and not recovered_requirement_ids:
+                return
+
+            classification = dict(review.get("classification") or {})
+            classification["unresolved_requirement_ids"] = [
+                requirement_id_map.get(str(requirement_id), str(requirement_id))
+                for requirement_id in classification.get(
+                    "unresolved_requirement_ids", []
+                )
+            ]
+            for detail_key in ("manual_review", "auto_applied"):
+                remapped_details = []
+                for raw_detail in classification.get(detail_key, []):
+                    detail = dict(raw_detail or {})
+                    old_id = str(detail.get("requirement_id") or "")
+                    if old_id:
+                        detail["requirement_id"] = requirement_id_map.get(
+                            old_id, old_id
+                        )
+                    remapped_details.append(detail)
+                if remapped_details or detail_key in classification:
+                    classification[detail_key] = remapped_details
+            if classification:
+                review["classification"] = classification
+            if recovered_requirement_ids or "recovered_requirement_ids" in review:
+                review["recovered_requirement_ids"] = list(recovered_requirement_ids)
+            review["updated_at"] = datetime.now(UTC).isoformat()
+            structure["requirements_review"] = review
+            document.structure_json = structure
+    except Exception:
+        log.exception(
+            "requirements review IDs could not be finalized for document %d",
+            document_id,
+        )
+        raise
+
+
+def _review_item_dict(item: ExtractedComplianceItem) -> dict:
+    return {
+        "requirement_id": item.requirement_id,
+        "requirement_text": item.requirement_text,
+        "requirement_type": item.requirement_type,
+        "category": item.category,
+        "source_page": item.source_page,
+        "source_section": item.source_section,
+    }
+
+
+def _normalized_requirement_text(text: str) -> str:
+    return " ".join((text or "").split()).strip().lower()
+
+
+def _append_verified_missing_requirements(
+    items: list[ExtractedComplianceItem],
+    candidates: Iterable[MissingRequirementCandidate],
+) -> int:
+    """Append only exact-source, HIGH-confidence, non-near-duplicate misses."""
+
+    seen = {
+        _normalized_requirement_text(item.requirement_text)
+        for item in items
+        if _normalized_requirement_text(item.requirement_text)
+    }
+    added = 0
+    for candidate in candidates:
+        if not candidate.auto_add_eligible:
+            continue
+        key = _normalized_requirement_text(candidate.requirement_text)
+        if not key or key in seen:
+            continue
+        added += 1
+        items.append(
+            ExtractedComplianceItem(
+                requirement_id=f"RECOVERED-{added:03d}",
+                requirement_text=candidate.requirement_text,
+                requirement_type=candidate.requirement_type,
+                category=candidate.category,
+                source_section=candidate.source_section,
+                source_page=candidate.source_page,
+                weight=candidate.weight,
+                extraction_origin="completeness",
+            )
+        )
+        seen.add(key)
+    return added
+
+
+def _failed_completeness_report(
+    *, source_text: str,
+) -> ComplianceCompletenessReport:
+    settings = get_settings()
+    report = ComplianceCompletenessReport(
+        source_units_total=1 if source_text.strip() else 0,
+        primary_model=settings.model_compliance_validator,
+        fallback_model=settings.model_compliance_validator_fallback,
+        source_sha256="unavailable",
+        matrix_sha256="unavailable",
+    )
+    if source_text.strip():
+        report.unresolved_unit_labels.append("source document")
+    return report
+
+
+def _failed_validation_report(
+    items: list[ExtractedComplianceItem],
+) -> ComplianceValidationReport:
+    settings = get_settings()
+    return ComplianceValidationReport(
+        total_count=len(items),
+        primary_model=settings.model_compliance_validator,
+        fallback_model=settings.model_compliance_validator_fallback,
+        unresolved_requirement_ids=[item.requirement_id for item in items],
+    )
+
+
+def _combined_review_state(
+    *,
+    document_id: int,
+    extraction_model: str,
+    initially_extracted: int,
+    recovered_count: int,
+    final_count: int,
+    validation: ComplianceValidationReport,
+    completeness: ComplianceCompletenessReport,
+    extraction_coverage: dict | None = None,
+) -> dict:
+    extraction_coverage = dict(
+        extraction_coverage
+        or {
+            "state": "complete",
+            "complete": True,
+            "source_chunks_total": 0,
+            "source_chunks_completed": 0,
+            "failed_chunk_count": 0,
+            "failed_chunk_labels": [],
+            "source_truncated": False,
+            "response_truncated": False,
+            "output_capped": False,
+            "malformed_items_skipped": 0,
+            "incomplete_reasons": [],
+        }
+    )
+    states = {validation.state, completeness.state}
+    manual_findings = (
+        validation.flagged_for_review_count
+        + validation.blocked_correction_count
+        + len(completeness.manual_review_candidates)
+        + len(completeness.uncertain_passages)
+    )
+    extraction_state = str(extraction_coverage.get("state") or "failed")
+    if extraction_state == "failed":
+        status = "failed"
+    elif extraction_state != "complete":
+        status = "partial"
+    elif validation.state == "failed" and completeness.state == "failed":
+        status = "failed"
+    elif states & {"failed", "partial"}:
+        status = "partial"
+    elif manual_findings:
+        status = "review_required"
+    elif "degraded" in states:
+        status = "degraded"
+    else:
+        status = "complete"
+
+    return {
+        "schema_version": 1,
+        "status": status,
+        "source_document_id": document_id,
+        "requires_manual_review": status != "complete" or bool(manual_findings),
+        "extraction": {
+            "model": extraction_model,
+            "initial_item_count": initially_extracted,
+            "recovered_item_count": recovered_count,
+            "final_item_count": final_count,
+            "coverage": extraction_coverage,
+        },
+        "classification": validation.as_public_dict(),
+        "completeness": completeness.as_public_dict(),
+        "known_review_cost_usd": round(
+            validation.cost_usd + completeness.cost_usd, 6
+        ),
+        # Kept for existing records/UI clients; this covers usage returned by
+        # review calls, not extraction or calls that failed before usage data.
+        "estimated_cost_usd": round(validation.cost_usd + completeness.cost_usd, 6),
+    }
+
+
+def _record_requirements_review_outcome(
+    proposal_id: int,
+    filename: str,
+    state: dict,
+) -> None:
+    classification = state["classification"]
+    completeness = state["completeness"]
+    extraction = state["extraction"]
+    extraction_coverage = dict(extraction.get("coverage") or {})
+    status = state["status"]
+    label = {
+        "complete": "complete",
+        "review_required": "complete; human review needed",
+        "degraded": "degraded; human review needed",
+        "partial": "partial",
+        "failed": "failed",
+    }[status]
+    message = (
+        f"Requirements review {label} for {filename}: "
+        f"{classification['reviewed_count']}/{classification['total_count']} items and "
+        f"{completeness['reviewed_units']}/{completeness['source_units_total']} "
+        f"source unit(s) reviewed with {classification['primary_model']}"
+    )
+    details: list[str] = []
+    if extraction_coverage.get("state") not in {None, "complete"}:
+        details.append(
+            "source extraction coverage "
+            + str(extraction_coverage.get("state") or "unknown")
+        )
+        failed_chunks = int(extraction_coverage.get("failed_chunk_count") or 0)
+        if failed_chunks:
+            details.append(f"{failed_chunks} extraction chunk(s) failed")
+    if classification["retry_used"] or completeness["retry_used"]:
+        details.append("smaller-batch retry used")
+    if classification["fallback_used"] or completeness["fallback_used"]:
+        details.append(f"fallback {classification['fallback_model']} used")
+    if extraction["recovered_item_count"]:
+        details.append(
+            f"{extraction['recovered_item_count']} verified omission(s) recovered"
+        )
+    flags = (
+        classification["flagged_for_review_count"]
+        + classification["blocked_correction_count"]
+        + completeness["manual_review_candidate_count"]
+        + completeness["uncertain_passage_count"]
+    )
+    if flags:
+        details.append(f"{flags} item(s) need human review")
+    unresolved = len(classification["unresolved_requirement_ids"]) + len(
+        completeness["unresolved_unit_labels"]
+    )
+    if unresolved:
+        details.append(f"{unresolved} review unit(s) unresolved")
+    if (
+        status == "complete"
+        and not details
+        and classification["findings_count"] == 0
+        and completeness["candidate_count"] == 0
+    ):
+        details.append("no issues found")
+    if details:
+        message += "; " + "; ".join(details)
+    message += "."
+    if status in {"degraded", "review_required"}:
+        message = "⚠ " + message
+    _set_stage(
+        proposal_id,
+        message,
+        status="failed" if status in {"failed", "partial"} else "completed",
+    )
+
+
 def _extract_one_doc_for_matrix(
     proposal_id: int,
     doc: dict,
-) -> tuple[str, list]:
-    """Worker — extract + repair + validate for a single RFP doc.
-    Returns (filename, items). Persistence happens in the main
-    thread to keep DB writes serialized."""
+) -> tuple[int, str, list[ExtractedComplianceItem]]:
+    """Extract, source-audit, classify, and summarize one source document."""
+
+    settings = get_settings()
+    document_id = int(doc["id"])
+    filename = str(doc["filename"])
+    source_text = str(doc["text"])
+    extraction_model = settings.model_compliance_matrix
+
+    _update_document_requirements_review(
+        document_id,
+        {
+            "schema_version": 1,
+            "status": "extracting",
+            "source_document_id": document_id,
+            "requires_manual_review": False,
+            "extraction": {"model": extraction_model, "initial_item_count": 0},
+        },
+    )
+    _set_stage(
+        proposal_id,
+        f"{filename}: extracting requirements with {extraction_model}…",
+    )
     result = extract_compliance_items(
-        document_text=doc["text"],
-        filename=doc["filename"],
+        document_text=source_text,
+        filename=filename,
         proposal_id=proposal_id,
+        max_workers=doc.get("extraction_workers"),
     )
     items = result.items
-    # Deterministic repair for residual truncation. The drafter
-    # sometimes still ends requirement_text with "…" mid-word
-    # despite the prompt rule; this pass finds the truncated start
-    # in the source PDF and copies the full sentence. Pure
-    # substring + sentence-boundary detection — no LLM call. Runs
-    # BEFORE the validator so the validator sees clean text.
+    extraction_coverage = result.coverage_as_public_dict()
+    initially_extracted = len(items)
+
     try:
-        _repair_truncated_items(items, doc["text"])
+        _repair_truncated_items(items, source_text)
     except Exception:
         log.exception(
             "truncation repair pass failed for %s — continuing with raw extraction.",
-            doc["filename"],
+            filename,
         )
-    # Cheap Haiku validation pass: catches type/category drift
-    # the drafter occasionally lets through (e.g.,
-    # requirement_type='certification' which is a category value).
-    # HIGH-confidence corrections apply in-place; MEDIUM/LOW
-    # surface as warnings without mutating the data. Failures are
-    # best-effort — extraction output still persists if validation
-    # breaks.
+
+    _update_document_requirements_review(
+        document_id,
+        {
+            "schema_version": 1,
+            "status": "reviewing",
+            "source_document_id": document_id,
+            "requires_manual_review": not extraction_coverage.get("complete", False),
+            "extraction": {
+                "model": extraction_model,
+                "initial_item_count": initially_extracted,
+                "coverage": extraction_coverage,
+            },
+            "classification": {
+                "state": "pending",
+                "primary_model": settings.model_compliance_validator,
+                "fallback_model": settings.model_compliance_validator_fallback,
+                "total_count": initially_extracted,
+                "reviewed_count": 0,
+            },
+            "completeness": {
+                "state": "running",
+                "primary_model": settings.model_compliance_validator,
+                "fallback_model": settings.model_compliance_validator_fallback,
+                "source_units_total": 0,
+                "reviewed_units": 0,
+            },
+        },
+    )
+    _set_stage(
+        proposal_id,
+        f"{filename}: checking source completeness with "
+        f"{settings.model_compliance_validator} "
+        f"({settings.model_compliance_validator_fallback} fallback enabled)…",
+    )
     try:
-        _validate_and_apply_corrections(items, proposal_id)
+        completeness = audit_compliance_completeness(
+            source_text=source_text,
+            source_filename=filename,
+            items=[_review_item_dict(item) for item in items],
+            proposal_id=proposal_id,
+        )
+    except Exception:
+        log.exception("source completeness audit crashed for %s", filename)
+        completeness = _failed_completeness_report(source_text=source_text)
+
+    recovered_count = _append_verified_missing_requirements(
+        items,
+        completeness.auto_add_candidates,
+    )
+    if recovered_count:
+        log.warning(
+            "requirements completeness: recovered %d verified omission(s) from %s",
+            recovered_count,
+            filename,
+        )
+
+    # Temporary document-scoped IDs keep validation unambiguous. The main
+    # thread assigns the proposal-global sequence after parallel work ends.
+    for index, item in enumerate(items, 1):
+        item.requirement_id = f"DOC-{document_id}-REQ-{index:03d}"
+
+    try:
+        validation = _validate_and_apply_corrections(
+            items,
+            proposal_id,
+            source_filename=filename,
+        )
     except Exception:
         log.exception(
-            "compliance_validator: pass failed for %s — persisting extraction unchanged.",
-            doc["filename"],
+            "classification review crashed for %s — extraction retained as unreviewed",
+            filename,
         )
-    return doc["filename"], items
+        validation = _failed_validation_report(items)
+
+    state = _combined_review_state(
+        document_id=document_id,
+        extraction_model=extraction_model,
+        initially_extracted=initially_extracted,
+        recovered_count=recovered_count,
+        final_count=len(items),
+        validation=validation,
+        completeness=completeness,
+        extraction_coverage=extraction_coverage,
+    )
+    _update_document_requirements_review(document_id, state)
+    _record_requirements_review_outcome(proposal_id, filename, state)
+    return document_id, filename, items
 
 
 def _run_compliance_matrix(proposal_id: int) -> int:
-    """For each parsed PDF, run the Compliance Matrix Agent and
-    persist items. Returns total items saved across all documents.
+    """Run source review in parallel, then persist proposal-global IDs."""
 
-    Documents are extracted in PARALLEL via ThreadPoolExecutor —
-    each doc gets its own worker (capped at shortfall_workers,
-    defaulting to 6). Persistence runs back in the main thread
-    inside as_completed so DB writes stay serialized. Per-doc
-    failures isolate (logged + skipped); remaining docs continue.
-    """
     with session_scope() as db:
         proposal = db.get(Proposal, proposal_id)
         if not proposal or not proposal.rfp_package:
             return 0
+        package_documents = (
+            db.query(RfpPackageDocument)
+            .filter(RfpPackageDocument.rfp_package_id == proposal.rfp_package_id)
+            .order_by(RfpPackageDocument.id)
+            .all()
+        )
         docs = [
             {"id": d.id, "filename": d.filename, "text": d.extracted_text_md or ""}
-            for d in proposal.rfp_package.documents
+            for d in package_documents
             if d.extracted_text_md
         ]
 
@@ -456,84 +1054,372 @@ def _run_compliance_matrix(proposal_id: int) -> int:
         return 0
 
     settings = get_settings()
-    workers = max(1, min(len(docs), int(settings.shortfall_workers or 1)))
+    provider_worker_budget = max(1, int(settings.shortfall_workers or 1))
+    workers = max(1, min(len(docs), provider_worker_budget))
+    # Each document can fan out into page chunks. Divide one proposal-level
+    # budget across the outer document workers so the two pools never multiply
+    # into shortfall_workers squared concurrent provider calls.
+    extraction_workers = max(1, provider_worker_budget // workers)
+    for doc in docs:
+        doc["extraction_workers"] = extraction_workers
     log.info(
-        "compliance_matrix: %d doc(s) × %d worker(s) in parallel",
+        "compliance_matrix: %d doc(s), %d document worker(s), "
+        "%d extraction worker(s) per document (budget=%d)",
         len(docs),
         workers,
+        extraction_workers,
+        provider_worker_budget,
     )
 
-    total = 0
+    results_by_document: dict[int, tuple[str, list[ExtractedComplianceItem]]] = {}
     with ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix=f"compmat-{proposal_id}",
     ) as executor:
         future_to_doc = {
-            executor.submit(
-                _extract_one_doc_for_matrix,
-                proposal_id,
-                d,
-            ): d
-            for d in docs
+            executor.submit(_extract_one_doc_for_matrix, proposal_id, doc): doc
+            for doc in docs
         }
         for future in as_completed(future_to_doc):
-            d = future_to_doc[future]
+            doc = future_to_doc[future]
             try:
-                filename, items = future.result()
+                document_id, filename, items = future.result()
             except Exception:
-                log.exception(
-                    "compliance matrix failed for %s",
-                    d["filename"],
+                log.exception("compliance matrix failed for %s", doc["filename"])
+                _update_document_requirements_review(
+                    int(doc["id"]),
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "source_document_id": int(doc["id"]),
+                        "requires_manual_review": True,
+                        "extraction": {
+                            "model": settings.model_compliance_matrix,
+                            "initial_item_count": 0,
+                        },
+                    },
+                )
+                _set_stage(
+                    proposal_id,
+                    f"{doc['filename']}: requirements extraction/review failed; "
+                    "manual review required.",
+                    status="failed",
                 )
                 continue
-            total += _persist_compliance_items(
-                proposal_id,
-                filename,
-                items,
-            )
+            results_by_document[document_id] = (filename, items)
+
+    total = 0
+    next_sequence = 1
+    for doc in docs:
+        document_id = int(doc["id"])
+        result = results_by_document.get(document_id)
+        if result is None:
+            continue
+        filename, items = result
+        requirement_id_map: dict[str, str] = {}
+        for item in items:
+            previous_id = item.requirement_id
+            item.requirement_id = f"REQ-{next_sequence:03d}"
+            requirement_id_map[previous_id] = item.requirement_id
+            next_sequence += 1
+        recovered_requirement_ids = [
+            item.requirement_id
+            for item in items
+            if item.extraction_origin == "completeness"
+        ]
+        saved = _persist_compliance_items(
+            proposal_id,
+            filename,
+            items,
+            source_document_id=document_id,
+        )
+        total += saved
+        _finalize_document_requirements_review_ids(
+            document_id,
+            requirement_id_map,
+            recovered_requirement_ids,
+        )
     return total
+
+
+def _next_global_requirement_sequence(existing_ids: Iterable[str]) -> int:
+    """Return the next proposal-wide ``REQ-NNN`` sequence number."""
+
+    highest = 0
+    for requirement_id in existing_ids:
+        match = re.fullmatch(r"REQ-(\d+)", str(requirement_id or ""), flags=re.I)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def review_late_attached_requirements(
+    proposal_id: int,
+    document_id: int,
+) -> int:
+    """Review and append requirements from a cost matrix attached after intake.
+
+    Provider work uses the same extraction, source-completeness, and
+    independent-classification path as original-package documents. Persistence
+    is serialized separately so no long-lived database lock is held while a
+    model runs, and proposal-global requirement IDs are allocated atomically.
+    Any failure is retained on the source document and therefore blocks scope
+    sign-off instead of being mistaken for a clean review.
+    """
+
+    with session_scope() as db:
+        proposal = db.get(Proposal, proposal_id)
+        document = db.get(RfpPackageDocument, document_id)
+        if (
+            proposal is None
+            or document is None
+            or document.rfp_package_id != proposal.rfp_package_id
+        ):
+            raise ValueError("Late-added cost matrix source was not found.")
+        source_text = document.extracted_text_md or ""
+        filename = document.filename
+        review = dict((document.structure_json or {}).get("requirements_review") or {})
+        review_status = str(review.get("status") or "").strip().lower()
+        existing_count = (
+            db.query(ComplianceMatrixItem)
+            .filter(
+                ComplianceMatrixItem.proposal_id == proposal_id,
+                ComplianceMatrixItem.source_document_id == document_id,
+            )
+            .count()
+        )
+
+    if existing_count and review_status in {
+        "complete",
+        "review_required",
+        "degraded",
+        "not_applicable",
+    }:
+        # Makes dispatch idempotent if an upload response is retried after the
+        # first review already committed its source rows.
+        return existing_count
+
+    if not _has_meaningful_extracted_text(source_text):
+        _update_document_requirements_review(
+            document_id,
+            {
+                "schema_version": 1,
+                "status": "not_applicable",
+                "source_document_id": document_id,
+                "requires_manual_review": False,
+                "reason": (
+                    "The cost matrix contains no separate written "
+                    "requirements to review."
+                ),
+                "extraction": {
+                    "initial_item_count": 0,
+                    "final_item_count": 0,
+                },
+            },
+        )
+        return 0
+
+    settings = get_settings()
+    _update_document_requirements_review(
+        document_id,
+        {
+            "schema_version": 1,
+            "status": "pending",
+            "source_document_id": document_id,
+            "requires_manual_review": False,
+            "reason": (
+                "Late-added cost matrix instructions are queued for source "
+                "extraction and independent review."
+            ),
+            "extraction": {
+                "model": settings.model_compliance_matrix,
+                "initial_item_count": 0,
+                "final_item_count": 0,
+            },
+        },
+        merge=True,
+    )
+
+    try:
+        require_proposal_mutable(
+            proposal_id,
+            operation="review late-added cost matrix requirements",
+        )
+        _, reviewed_filename, items = _extract_one_doc_for_matrix(
+            proposal_id,
+            {
+                "id": document_id,
+                "filename": filename,
+                "text": source_text,
+            },
+        )
+
+        requirement_id_map: dict[str, str] = {}
+        with proposal_write_lock(proposal_id):
+            with session_scope() as db:
+                acquire_proposal_write_fence(db, proposal_id)
+                proposal = ensure_proposal_mutable(
+                    db,
+                    proposal_id,
+                    operation="append late-added cost matrix requirements",
+                )
+                document = db.get(RfpPackageDocument, document_id)
+                if (
+                    proposal is None
+                    or document is None
+                    or document.rfp_package_id != proposal.rfp_package_id
+                ):
+                    raise ValueError("Late-added cost matrix source was not found.")
+
+                existing_ids = [
+                    value
+                    for (value,) in db.query(
+                        ComplianceMatrixItem.requirement_id
+                    )
+                    .filter(ComplianceMatrixItem.proposal_id == proposal_id)
+                    .all()
+                ]
+                existing_source_rows = (
+                    db.query(ComplianceMatrixItem)
+                    .filter(
+                        ComplianceMatrixItem.proposal_id == proposal_id,
+                        ComplianceMatrixItem.source_document_id == document_id,
+                    )
+                    .order_by(ComplianceMatrixItem.id)
+                    .all()
+                )
+                existing_by_text: dict[str, ComplianceMatrixItem] = {}
+                for existing_row in existing_source_rows:
+                    key = _normalized_requirement_text(
+                        existing_row.requirement_text
+                    )
+                    if key and key not in existing_by_text:
+                        existing_by_text[key] = existing_row
+                retained_existing_row_ids: set[int] = set()
+                next_sequence = _next_global_requirement_sequence(existing_ids)
+                for item in items:
+                    temporary_id = item.requirement_id
+                    item_key = _normalized_requirement_text(item.requirement_text)
+                    existing_row = existing_by_text.get(item_key)
+                    if existing_row is not None:
+                        item.requirement_id = existing_row.requirement_id
+                        retained_existing_row_ids.add(existing_row.id)
+                    else:
+                        item.requirement_id = f"REQ-{next_sequence:03d}"
+                        next_sequence += 1
+                    requirement_id_map[temporary_id] = item.requirement_id
+
+                    try:
+                        requirement_type = RequirementType(item.requirement_type)
+                    except ValueError:
+                        key = (item.requirement_type or "").lower().strip()
+                        requirement_type = _REQUIREMENT_TYPE_FALLBACKS.get(
+                            key,
+                            RequirementType.SHOULD,
+                        )
+                    try:
+                        category = RequirementCategory(item.category)
+                    except ValueError:
+                        key = (item.category or "").lower().strip()
+                        category = _REQUIREMENT_CATEGORY_FALLBACKS.get(
+                            key,
+                            RequirementCategory.ADMINISTRATIVE,
+                        )
+
+                    if existing_row is not None:
+                        # A retry after an incomplete review reuses the stable
+                        # source row and applies the newly reviewed metadata;
+                        # it never duplicates that requirement.
+                        existing_row.requirement_text = item.requirement_text
+                        existing_row.source_doc = reviewed_filename
+                        existing_row.source_section = item.source_section
+                        existing_row.source_page = item.source_page
+                        existing_row.requirement_type = requirement_type
+                        existing_row.category = category
+                        existing_row.weight = item.weight
+                    else:
+                        db.add(ComplianceMatrixItem(
+                            proposal_id=proposal_id,
+                            requirement_id=item.requirement_id,
+                            requirement_text=item.requirement_text,
+                            source_doc=reviewed_filename,
+                            source_document_id=document_id,
+                            source_section=item.source_section,
+                            source_page=item.source_page,
+                            requirement_type=requirement_type,
+                            category=category,
+                            weight=item.weight,
+                            compliance_status=ComplianceStatus.TO_BE_DRAFTED,
+                        ))
+
+                # A retry replaces this source document's prior incomplete
+                # extraction. Rows no longer present in the successful/current
+                # result must not remain active while durable state reports a
+                # smaller final count. ORM deletion preserves configured child
+                # cascades and avoids leaving stale gap rows behind.
+                for existing_row in existing_source_rows:
+                    if existing_row.id not in retained_existing_row_ids:
+                        db.delete(existing_row)
+
+        recovered_requirement_ids = [
+            item.requirement_id
+            for item in items
+            if item.extraction_origin == "completeness"
+        ]
+        _finalize_document_requirements_review_ids(
+            document_id,
+            requirement_id_map,
+            recovered_requirement_ids,
+        )
+        return len(items)
+    except Exception:
+        log.exception(
+            "late-added cost matrix requirements review failed for %s",
+            filename,
+        )
+        _update_document_requirements_review(
+            document_id,
+            {
+                "status": "failed",
+                "source_document_id": document_id,
+                "requires_manual_review": True,
+                "reason": (
+                    "Late-added cost matrix requirements review failed. "
+                    "Retry the review before scope sign-off."
+                ),
+            },
+            merge=True,
+        )
+        _set_stage(
+            proposal_id,
+            f"{filename}: late-added requirements review failed; "
+            "manual review required.",
+            status="failed",
+        )
+        return 0
 
 
 def _validate_and_apply_corrections(
     items: list[ExtractedComplianceItem],
     proposal_id: int,
-) -> None:
-    """Run the Haiku validator on the extracted items and mutate them
-    in-place for HIGH-confidence corrections. MEDIUM / LOW issues are
-    logged + staged but the items are not modified — the user sees the
-    flag and can edit manually if needed.
+    *,
+    source_filename: str = "source document",
+) -> ComplianceValidationReport:
+    """Run independent review and apply only safe HIGH corrections."""
 
-    No-op when `items` is empty.
-    """
-    if not items:
-        return
-
-    _set_stage(
-        proposal_id,
-        f"Validating compliance matrix ({len(items)} items, Haiku, ~$0.05)…",
-    )
-
-    item_dicts = [
-        {
-            "requirement_id": it.requirement_id,
-            "requirement_text": it.requirement_text,
-            "requirement_type": it.requirement_type,
-            "category": it.category,
-        }
-        for it in items
-    ]
-    results = validate_compliance_items(item_dicts, proposal_id=proposal_id)
-
-    if not results:
-        log.info(
-            "compliance_validator: %d item(s) audited, no issues found.",
-            len(items),
-        )
+    settings = get_settings()
+    if items:
         _set_stage(
             proposal_id,
-            f"Validation: {len(items)} items checked, no issues.",
+            f"{source_filename}: reviewing {len(items)} extracted requirement(s) "
+            f"with {settings.model_compliance_validator} "
+            f"({settings.model_compliance_validator_fallback} fallback enabled)…",
         )
-        return
+
+    report = validate_compliance_items_report(
+        [_review_item_dict(item) for item in items],
+        proposal_id=proposal_id,
+    )
 
     # Index items by ID for O(1) lookup during apply.
     items_by_id = {it.requirement_id: it for it in items}
@@ -542,7 +1428,9 @@ def _validate_and_apply_corrections(
     n_warned = 0
     n_blocked = 0
     n_dropped_noop = 0
-    for r in results:
+    manual_review_findings = []
+    auto_applied_changes: list[dict] = []
+    for r in report.findings:
         item = items_by_id.get(r.requirement_id)
         if item is None:
             log.warning(
@@ -578,7 +1466,10 @@ def _validate_and_apply_corrections(
         confidence = (r.confidence or "").upper()
         applied: list[str] = []
         blocked_flip = False
-        if confidence == "HIGH":
+        # Only the independent primary reviewer can authorize an automatic
+        # mutation. A Haiku fallback finding is useful signal, but because the
+        # extractor is also Anthropic it remains a human-review recommendation.
+        if confidence == "HIGH" and r.review_role == "primary":
             if r.suggested_type and r.suggested_type != item.requirement_type:
                 if _is_unsupported_verb_strictness_flip(
                     item.requirement_text,
@@ -604,10 +1495,32 @@ def _validate_and_apply_corrections(
                     old = item.requirement_type
                     item.requirement_type = r.suggested_type
                     applied.append(f"type {old!r}->{r.suggested_type!r}")
+                    auto_applied_changes.append(
+                        {
+                            "requirement_id": r.requirement_id,
+                            "field": "requirement_type",
+                            "from": old,
+                            "to": r.suggested_type,
+                            "issue": r.issue,
+                            "reason": r.reason,
+                            "review_role": r.review_role,
+                        }
+                    )
             if r.suggested_category and r.suggested_category != item.category:
                 old = item.category
                 item.category = r.suggested_category
                 applied.append(f"category {old!r}->{r.suggested_category!r}")
+                auto_applied_changes.append(
+                    {
+                        "requirement_id": r.requirement_id,
+                        "field": "category",
+                        "from": old,
+                        "to": r.suggested_category,
+                        "issue": r.issue,
+                        "reason": r.reason,
+                        "review_role": r.review_role,
+                    }
+                )
 
         if applied:
             n_auto_applied += 1
@@ -630,14 +1543,28 @@ def _validate_and_apply_corrections(
                 r.suggested_category,
             )
 
-    blocked_part = f", {n_blocked} unsupported flip(s) blocked" if n_blocked else ""
-    noop_part = f", {n_dropped_noop} no-op suggestion(s) dropped" if n_dropped_noop else ""
-    summary = (
-        f"Validation: {n_auto_applied} auto-fix(es), "
-        f"{n_warned} item(s) flagged for review{blocked_part}{noop_part}."
+        if blocked_flip or not applied:
+            manual_review_findings.append(r)
+
+    report.auto_applied_count = n_auto_applied
+    report.flagged_for_review_count = n_warned
+    report.blocked_correction_count = n_blocked
+    report.noop_finding_count = n_dropped_noop
+    report.manual_review_findings = manual_review_findings
+    report.auto_applied_changes = auto_applied_changes
+    log.info(
+        "compliance_validator: %s — %d/%d reviewed, %d auto-fix(es), "
+        "%d flag(s), %d blocked, %d no-op, state=%s",
+        source_filename,
+        report.reviewed_count,
+        report.total_count,
+        n_auto_applied,
+        n_warned,
+        n_blocked,
+        n_dropped_noop,
+        report.state,
     )
-    log.info("compliance_validator: %s", summary)
-    _set_stage(proposal_id, summary)
+    return report
 
 
 # Mandatory-verb tokens that justify a `shall` / `must` classification
@@ -647,6 +1574,15 @@ _MANDATORY_VERB_RE = re.compile(
     r"\b(shall|must|is required to|are required to|will be required)\b",
     re.IGNORECASE,
 )
+_SHALL_TARGET_RE = re.compile(
+    r"\b(shall|is required to|are required to|will be required)\b",
+    re.IGNORECASE,
+)
+_MUST_TARGET_RE = re.compile(
+    r"\b(must|is required to|are required to|will be required)\b",
+    re.IGNORECASE,
+)
+_SHOULD_TARGET_RE = re.compile(r"\bshould\b", re.IGNORECASE)
 _VERB_STRICTNESS_TYPES = {"shall", "must", "should"}
 
 
@@ -659,12 +1595,17 @@ def _is_unsupported_verb_strictness_flip(text: str, current_type: str, suggested
         return False
     if suggested_type not in _VERB_STRICTNESS_TYPES:
         return False
-    # `should` doesn't need a mandatory verb in the text; flips toward
-    # `should` (loosening) are always safe to apply when HIGH-confidence.
     if suggested_type == "should":
-        return False
-    # Tightening to shall/must requires the verb in the visible text.
-    return not _MANDATORY_VERB_RE.search(text or "")
+        # Never downgrade a visible mandatory obligation merely because the
+        # snippet also contains advisory language.
+        return bool(_MANDATORY_VERB_RE.search(text or "")) or not bool(
+            _SHOULD_TARGET_RE.search(text or "")
+        )
+    if suggested_type == "shall":
+        return not bool(_SHALL_TARGET_RE.search(text or ""))
+    if suggested_type == "must":
+        return not bool(_MUST_TARGET_RE.search(text or ""))
+    return True
 
 
 def _persist_shortfall_results(
@@ -870,6 +1811,7 @@ def _run_shortfall_strategist(proposal_id: int) -> tuple[int, bool]:
                     f"{type(exc).__name__}: {str(exc)[:140]}. "
                     f"Re-run shortfall analysis from Proposal Review when "
                     f"intake completes.",
+                    status="failed",
                 )
                 continue
             gaps, no_bid = _persist_shortfall_results(
@@ -892,6 +1834,7 @@ def _run_shortfall_strategist(proposal_id: int) -> tuple[int, bool]:
             f"Shortfall pipeline finished with {len(failed_batches)} "
             f"failed batch(es) (#{', #'.join(str(b) for b in failed_batches)}). "
             f"Use 'Re-run shortfall analysis' on Proposal Review to fill the gaps.",
+            status="failed",
         )
     return total_gaps, any_no_bid
 
@@ -1140,7 +2083,11 @@ def _enrich_teaming_partners(proposal_id: int) -> None:
     summary = f"Teaming research complete: {completed}/{len(teaming_gaps)} gap(s) enriched"
     if failed:
         summary += f"; {len(failed)} failed (#{', #'.join(failed)})"
-    _set_stage(proposal_id, summary)
+    _set_stage(
+        proposal_id,
+        summary,
+        status="failed" if failed else "completed",
+    )
 
 
 # Approaches the Strategist generates that are SAFE to auto-resolve when
@@ -1326,11 +2273,12 @@ def run_intake_pipeline(proposal_id: int) -> None:
 
     Stages:
       1. Parse PDFs (pdfplumber, DOCX, XLSX via the dispatcher).
-      2. Compliance Matrix Agent (Sonnet) per RFP doc.
+      2. Configured source extractor plus independent requirements review.
       3. Shortfall Strategist (Sonnet, batched, cached prefix) over every item.
     Status flips: intaking → awaiting_scope_signoff (the design doc's
     human-review gate before further drafting / pricing).
     """
+    require_proposal_mutable(proposal_id, operation="run intake")
     log.info("intake pipeline starting for proposal %d", proposal_id)
     try:
         _set_stage(proposal_id, "Parsing PDFs…")
@@ -1339,9 +2287,20 @@ def run_intake_pipeline(proposal_id: int) -> None:
 
         _detect_cots_orientation(proposal_id)
 
-        _set_stage(proposal_id, "Extracting compliance matrix (Sonnet)…")
+        settings = get_settings()
+        _set_stage(
+            proposal_id,
+            "Extracting requirements from the RFP package with "
+            f"{settings.model_compliance_matrix}…",
+        )
         items = _run_compliance_matrix(proposal_id)
         _set_stage(proposal_id, f"Compliance matrix: {items} item(s) extracted.")
+
+        if items <= 0:
+            raise RuntimeError(
+                "Compliance extraction returned zero requirements; "
+                "intake cannot advance to scope sign-off."
+            )
 
         try:
             _set_stage(proposal_id, "Extracting evaluation criteria (Section M)\u2026")
@@ -1356,6 +2315,7 @@ def run_intake_pipeline(proposal_id: int) -> None:
                 proposal_id,
                 "\u26a0 Evaluation criteria extraction failed \u2014 see logs. "
                 "Re-run from the Evaluation Criteria tab.",
+                status="failed",
             )
 
         if items > 0:
@@ -1405,7 +2365,12 @@ def run_intake_pipeline(proposal_id: int) -> None:
         )
     except Exception:
         log.exception("intake pipeline failed for proposal %d", proposal_id)
-        _set_stage(proposal_id, "Pipeline failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Pipeline failed — check logs.",
+            status="failed",
+            terminal=True,
+        )
 
 
 def run_shortfall_only(proposal_id: int) -> None:
@@ -1413,6 +2378,9 @@ def run_shortfall_only(proposal_id: int) -> None:
     existing GapAnalysis rows for this proposal first so re-runs don't
     accumulate. Used by the 'Run shortfall analysis' button on the
     Proposal Review page."""
+    require_proposal_mutable(
+        proposal_id, operation="run shortfall analysis",
+    )
     log.info("shortfall-only run starting for proposal %d", proposal_id)
     try:
         _set_stage(proposal_id, "Clearing previous shortfall analysis…")
@@ -1438,7 +2406,11 @@ def run_shortfall_only(proposal_id: int) -> None:
                 proposal.status = ProposalStatus.AWAITING_SCOPE_SIGNOFF
     except Exception:
         log.exception("shortfall-only run failed for proposal %d", proposal_id)
-        _set_stage(proposal_id, "Shortfall analysis failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Shortfall analysis failed — check logs.",
+            status="failed",
+        )
 
 
 def run_teaming_research_only(proposal_id: int) -> None:
@@ -1448,6 +2420,9 @@ def run_teaming_research_only(proposal_id: int) -> None:
     ~$0.05/gap cost only when they're actually exploring teaming as
     a mitigation path. Idempotent — running twice just refreshes
     partner data on each gap with a teaming-style mitigation."""
+    require_proposal_mutable(
+        proposal_id, operation="run teaming research",
+    )
     log.info("teaming-only run starting for proposal %d", proposal_id)
     try:
         _enrich_teaming_partners(proposal_id)
@@ -1459,6 +2434,7 @@ def run_teaming_research_only(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             "Teaming research failed — check logs.",
+            status="failed",
         )
 
 
@@ -1508,6 +2484,9 @@ def run_section_m_only(proposal_id: int) -> None:
     re-extract evaluation criteria from the Evaluation Criteria tab
     without running a full intake re-run.
     """
+    require_proposal_mutable(
+        proposal_id, operation="extract evaluation criteria",
+    )
     log.info("section_m_only starting for proposal %d", proposal_id)
     try:
         _set_stage(proposal_id, "Re-extracting evaluation criteria (Section M)…")
@@ -1520,6 +2499,7 @@ def run_section_m_only(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 "⚠ Section M extraction failed — see logs.",
+                status="failed",
             )
     except Exception:
         log.exception(
@@ -1529,6 +2509,7 @@ def run_section_m_only(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             "⚠ Section M extraction failed — see logs.",
+            status="failed",
         )
 
 

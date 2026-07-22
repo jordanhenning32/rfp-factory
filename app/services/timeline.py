@@ -8,7 +8,7 @@ State lives in a single JSON document on `proposals.timeline_json`
         "anchor_date": "YYYY-MM-DD" | null,
         "phases": [
             {
-                "id": str (uuid4),
+                "id": str (uuid4 for new phases; stable uuid5 for legacy phases),
                 "phase_name": str,
                 "start_offset": int (days from project start, >= 0),
                 "duration": int (days, >= 1),
@@ -36,6 +36,7 @@ from typing import Any
 
 from app.db.session import session_scope
 from app.models import Proposal
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -87,19 +88,41 @@ def get_timeline(proposal_id: int) -> dict:
     if not isinstance(phases_raw, list):
         phases_raw = []
 
-    phases = [_normalize_phase(p) for p in phases_raw if isinstance(p, dict)]
+    phases = [
+        _normalize_phase(
+            phase,
+            # Older timeline documents predate phase IDs.  The UI reads a
+            # phase once and the mutator reads the document again, so a
+            # random fallback here makes the edit/delete ID impossible to
+            # match.  A proposal-and-position-derived UUID is stable across
+            # those reads; the next mutation persists it in the document.
+            fallback_id=_legacy_phase_id(proposal_id, index),
+        )
+        for index, phase in enumerate(phases_raw)
+        if isinstance(phase, dict)
+    ]
     phases.sort(
         key=lambda p: (p["start_offset"], p["order"], p["id"]),
     )
     return {"anchor_date": anchor, "phases": phases}
 
 
-def _normalize_phase(p: dict) -> dict:
+def _legacy_phase_id(proposal_id: int, index: int) -> str:
+    """Return a stable identity for a phase from an ID-less legacy blob."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"rfp-agent:timeline:{proposal_id}:phase:{index}",
+        )
+    )
+
+
+def _normalize_phase(p: dict, *, fallback_id: str | None = None) -> dict:
     """Heal a phase dict so the UI doesn't have to guard every field.
     Defaults are conservative — any missing/invalid value becomes a
     sensible no-op, never None / NaN. Idempotent."""
     return {
-        "id": str(p.get("id") or uuid.uuid4()),
+        "id": str(p.get("id") or fallback_id or uuid.uuid4()),
         "phase_name": str(p.get("phase_name") or "Untitled phase"),
         "start_offset": max(0, _coerce_int(p.get("start_offset"), 0)),
         "duration": max(1, _coerce_int(p.get("duration"), 1)),
@@ -137,7 +160,9 @@ def _save(proposal_id: int, anchor_date: str | None, phases: list[dict]) -> None
         "phases": [_normalize_phase(p) for p in phases],
     }
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="change proposal timeline",
+        )
         if p is None:
             raise ValueError(f"proposal {proposal_id} not found")
         p.timeline_json = json.dumps(payload, ensure_ascii=False)

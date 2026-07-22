@@ -27,6 +27,7 @@ from app.agents.section_m_extractor import extract_evaluation_criteria
 from app.db.session import session_scope
 from app.models import Proposal
 from app.models.compliance import ComplianceMatrixItem
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,11 @@ def extract_and_persist_evaluation_criteria(proposal_id: int) -> bool:
     Returns True on success, False on failure (failure is logged via
     log.exception so the operator can inspect the traceback).
     """
+    with session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="extract evaluation criteria",
+        )
+
     try:
         # --- snapshot phase: read all needed primitives before LLM call ---
         from app.jobs.intake import _extract_text_for_intake  # local import avoids circular
@@ -114,7 +120,9 @@ def extract_and_persist_evaluation_criteria(proposal_id: int) -> bool:
 
         # --- persistence phase ---
         with session_scope() as db:
-            proposal = db.get(Proposal, proposal_id)
+            proposal = ensure_proposal_mutable(
+                db, proposal_id, operation="persist evaluation criteria",
+            )
             if proposal is None:
                 log.error(
                     "evaluation_criteria: proposal %d vanished before persist.",

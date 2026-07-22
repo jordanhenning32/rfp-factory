@@ -41,8 +41,12 @@ def _render_spend_tab(proposal_id: int) -> None:
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center justify-between w-full flex-wrap gap-3"):
                 with ui.column().classes("gap-0"):
-                    ui.label(f"${summary.total_cost_usd:.4f}").classes("text-2xl font-semibold")
-                    ui.label("total LLM input + output spend").classes("text-xs opacity-70")
+                    ui.label(
+                        f"${summary.total_cost_usd:.4f}"
+                    ).classes("text-2xl font-semibold")
+                    ui.label("estimated API cost from recorded tokens").classes(
+                        "text-xs opacity-70"
+                    )
                 with ui.column().classes("gap-0"):
                     ui.label(f"{summary.total_calls:,} calls").classes("text-base font-medium")
                     in_tok = summary.total_input_tokens
@@ -70,8 +74,9 @@ def _render_spend_tab(proposal_id: int) -> None:
             ui.label("By pipeline stage").classes("text-base font-medium pb-1")
             ui.label(
                 "Stages logically group related agent calls — e.g., "
-                "Compliance Matrix bundles the matrix extractor + the "
-                "Haiku validator. Bars are normalized to total spend."
+                "Compliance Matrix bundles source extraction, independent "
+                "classification, source-completeness review, retries, and "
+                "fallbacks. Bars are normalized to total estimated API cost."
             ).classes("text-xs opacity-60 pb-2")
             max_stage_cost = max((s.cost_usd for s in summary.stages), default=0.0) or 1.0
             for st in summary.stages:
@@ -101,8 +106,8 @@ def _render_spend_tab(proposal_id: int) -> None:
                 "Granular view — every distinct agent_name, sorted by "
                 "cost descending. Useful for spotting which specific "
                 "agent inside a stage is the hot spot (e.g., is "
-                "Reviewer A's spend driven by Opus revisions or by the "
-                "initial pass?)."
+                "review spend is driven by repeated revision passes or by "
+                "the initial pass?)."
             ).classes("text-xs opacity-60 pb-2")
             columns = [
                 {

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 
 from nicegui import ui
+from nicegui.elements.switch import Switch
 from sqlalchemy import select
 
 from app.core.enums import ProposalStatus
@@ -37,6 +38,29 @@ from app.services.sections import (
 from app.ui._shared import _empty_state
 
 log = logging.getLogger(__name__)
+
+
+class _ImmediateSwitch(Switch):
+    """A switch whose visual value changes before the server round trip.
+
+    NiceGUI switches use server loopback by default.  A user can therefore
+    click the same apparent value twice while the first change is being
+    persisted, which loses a quick reversal.  This outline control is kept
+    mounted and owns its value locally while the server persists each ordered
+    change.
+    """
+
+    LOOPBACK = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # NiceGUI's generic non-loopback handler assigns the complete event
+        # argument array to ``model-value``.  QToggle expects the scalar bool,
+        # so finish the same browser event by assigning that scalar locally.
+        self.on(
+            "update:model-value",
+            js_handler="(value) => { element.props['model-value'] = value; }",
+        )
 
 
 def _generate_outline(proposal_id: int) -> None:
@@ -215,31 +239,40 @@ def _render_outline_tab(
         duplicated = {k: v for k, v in duplicated.items() if len(v) > 1}
 
         n_cost_deferred = sum(1 for s in sections if s["requires_cost_analysis"])
-        n_excluded_from_draft = sum(1 for s in sections if s["excluded_from_draft"])
         n_eligible = len(outline_eligible_ids)
         n_eligible_assigned = len(assigned_ids & outline_eligible_ids)
         n_checklist = len(checklist_handled_ids)
+
+        def _outline_stats_text() -> str:
+            """Build the summary from the current in-memory control state."""
+            stat_parts = [
+                f"{n_eligible_assigned} of {n_eligible} narrative items mapped",
+            ]
+            if unassigned:
+                stat_parts.append(f"{len(unassigned)} unassigned")
+            if duplicated:
+                stat_parts.append(f"{len(duplicated)} duplicated")
+            if n_checklist:
+                stat_parts.append(f"{n_checklist} on Submission Checklist")
+            if n_cost_deferred:
+                stat_parts.append(f"{n_cost_deferred} cost-deferred")
+            n_excluded = sum(
+                1 for section in sections if section["excluded_from_draft"]
+            )
+            if n_excluded:
+                stat_parts.append(f"{n_excluded} excluded from draft")
+            return " · ".join(stat_parts)
 
         # Action row at top — varies by status.
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center justify-between w-full"):
                 with ui.column().classes("gap-0"):
-                    ui.label(f"{len(sections)} section{'s' if len(sections) != 1 else ''}").classes(
-                        "text-base font-semibold"
-                    )
-                    stat_parts: list[str] = []
-                    stat_parts.append(f"{n_eligible_assigned} of {n_eligible} narrative items mapped")
-                    if unassigned:
-                        stat_parts.append(f"{len(unassigned)} unassigned")
-                    if duplicated:
-                        stat_parts.append(f"{len(duplicated)} duplicated")
-                    if n_checklist:
-                        stat_parts.append(f"{n_checklist} on Submission Checklist")
-                    if n_cost_deferred:
-                        stat_parts.append(f"{n_cost_deferred} cost-deferred")
-                    if n_excluded_from_draft:
-                        stat_parts.append(f"{n_excluded_from_draft} excluded from draft")
-                    ui.label(" · ".join(stat_parts)).classes("text-xs opacity-70")
+                    ui.label(
+                        f"{len(sections)} section{'s' if len(sections) != 1 else ''}"
+                    ).classes("text-base font-semibold")
+                    outline_stats_label = ui.label(
+                        _outline_stats_text()
+                    ).classes("text-xs opacity-70")
 
                 with ui.row().classes("gap-2 items-center"):
                     # Status past awaiting_outline_approval = outline has
@@ -270,9 +303,9 @@ def _render_outline_tab(
                             icon="rule_folder",
                             on_click=lambda: _approve_outline(proposal_id),
                         ).props("color=primary").tooltip(
-                            "Phase 2B reorder: approving the outline "
-                            "moves you to the Team tab. Draft kicks "
-                            "off after Team + Cost are in place."
+                            "Approving the outline moves you to the Team tab. "
+                            "Drafting starts after the team is approved and "
+                            "the cost build is ready."
                         )
                     if status_val in (
                         "drafting",
@@ -387,13 +420,18 @@ def _render_outline_tab(
                                     "pricing is built — not by the regular "
                                     "Writer Team."
                                 )
-                            if s["excluded_from_draft"]:
-                                ui.chip(
-                                    "Excluded from draft",
-                                    icon="block",
-                                ).props("color=amber-3 text-color=amber-9 dense").tooltip(
-                                    "Writer Team will skip this section entirely — no draft is generated."
-                                )
+                            excluded_chip = ui.chip(
+                                "Excluded from draft",
+                                icon="block",
+                            ).props(
+                                "color=amber-3 text-color=amber-9 dense"
+                            ).tooltip(
+                                "Writer Team will skip this section "
+                                "entirely — no draft is generated."
+                            )
+                            excluded_chip.set_visibility(
+                                s["excluded_from_draft"]
+                            )
                         if s["section_brief"]:
                             ui.label(s["section_brief"]).classes("text-sm opacity-80 pt-1")
                     with ui.column().classes("gap-1 items-end"):
@@ -412,17 +450,59 @@ def _render_outline_tab(
                         # need narrative response and slipped past the
                         # auto-filter (e.g., "Attachment C — Description
                         # of Offeror" wrapper).
-                        ui.switch(
+                        control_state = {
+                            "value": s["excluded_from_draft"],
+                            "switch": None,
+                            "reverting": False,
+                        }
+
+                        def _handle_excluded_change(
+                            e,
+                            *,
+                            section=s,
+                            chip=excluded_chip,
+                            state=control_state,
+                        ) -> None:
+                            if state["reverting"]:
+                                return
+                            value = bool(e.value)
+                            previous = bool(state["value"])
+                            if value == previous:
+                                return
+
+                            def update_in_place() -> None:
+                                state["value"] = value
+                                section["excluded_from_draft"] = value
+                                chip.set_visibility(value)
+                                outline_stats_label.set_text(
+                                    _outline_stats_text()
+                                )
+                                if on_state_change is not None:
+                                    on_state_change()
+
+                            if _toggle_excluded_from_draft(
+                                section["pk"], value, update_in_place,
+                            ):
+                                return
+
+                            # Client-owned switches do not wait for loopback,
+                            # so explicitly restore the last persisted value
+                            # when the write was rejected.
+                            state["reverting"] = True
+                            try:
+                                switch = state["switch"]
+                                switch.set_value(previous)
+                                switch.update()
+                            finally:
+                                state["reverting"] = False
+
+                        excluded_switch = _ImmediateSwitch(
                             "Exclude from draft",
                             value=s["excluded_from_draft"],
-                            on_change=(
-                                lambda e, pk=s["pk"]: _toggle_excluded_from_draft(
-                                    pk,
-                                    bool(e.value),
-                                    _after_change,
-                                )
-                            ),
-                        ).props("dense").tooltip(
+                            on_change=_handle_excluded_change,
+                        )
+                        control_state["switch"] = excluded_switch
+                        excluded_switch.props("dense").tooltip(
                             "Toggle ON to make the Writer Team skip this "
                             "section completely — no draft will be "
                             "generated. Use for wrapper sections the "
@@ -467,14 +547,14 @@ def _toggle_cost_deferred(section_pk: int, value: bool, on_change) -> None:
     on_change()
 
 
-def _toggle_excluded_from_draft(section_pk: int, value: bool, on_change) -> None:
+def _toggle_excluded_from_draft(section_pk: int, value: bool, on_change) -> bool:
     """Mark a section excluded from drafting (or clear). The Writer Team
     skips excluded sections entirely — no draft is generated. Use case:
     Outline Agent produced a wrapper section for a form / attachment /
     instructions item that slipped past the auto-filter."""
     if not set_section_excluded_from_draft(section_pk, value):
         ui.notify("Could not update section.", type="negative")
-        return
+        return False
     if value:
         ui.notify(
             "Excluded from draft. Writer Team will skip this section entirely.",
@@ -488,3 +568,4 @@ def _toggle_excluded_from_draft(section_pk: int, value: bool, on_change) -> None
             type="positive",
         )
     on_change()
+    return True

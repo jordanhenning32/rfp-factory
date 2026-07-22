@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from app.db.session import session_scope
 from app.models import Proposal, ProposalTeamMember
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -188,7 +189,9 @@ def add_team_member(
         kind = "named"
 
     with session_scope() as db:
-        prop = db.get(Proposal, proposal_id)
+        prop = ensure_proposal_mutable(
+            db, proposal_id, operation="add proposal team member",
+        )
         if prop is None:
             return None
         # Append to end of list — find the current max display_order.
@@ -240,6 +243,9 @@ def update_team_member(member_id: int, data: dict) -> bool:
         m = db.get(ProposalTeamMember, member_id)
         if m is None:
             return False
+        ensure_proposal_mutable(
+            db, m.proposal_id, operation="update proposal team member",
+        )
         if "role_name" in data:
             v = (data["role_name"] or "").strip()
             if v:
@@ -294,7 +300,9 @@ def replace_team(proposal_id: int, roles: list[dict]) -> int:
     """
     written = 0
     with session_scope() as db:
-        prop = db.get(Proposal, proposal_id)
+        prop = ensure_proposal_mutable(
+            db, proposal_id, operation="replace proposal team",
+        )
         if prop is None:
             return 0
         # Clear existing roster.
@@ -349,6 +357,9 @@ def delete_team_member(member_id: int) -> bool:
         if m is None:
             return False
         proposal_id = m.proposal_id
+        ensure_proposal_mutable(
+            db, proposal_id, operation="delete proposal team member",
+        )
         db.delete(m)
         prop = db.get(Proposal, proposal_id)
         if prop is not None:
@@ -375,7 +386,9 @@ def approve_team(proposal_id: int) -> bool:
     from app.core.enums import ProposalStatus
 
     with session_scope() as db:
-        prop = db.get(Proposal, proposal_id)
+        prop = ensure_proposal_mutable(
+            db, proposal_id, operation="approve proposal team",
+        )
         if prop is None:
             return False
         members = (

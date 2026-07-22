@@ -17,8 +17,9 @@ from __future__ import annotations
 from nicegui import ui
 from sqlalchemy import select
 
-from app.db.session import SessionLocal, session_scope
+from app.db.session import SessionLocal
 from app.models import ComplianceMatrixItem
+from app.services.submission_commitments import set_rfp_required_item_obtained
 from app.ui._shared import _empty_state
 
 
@@ -74,11 +75,215 @@ def _render_system_verified_section(proposal_id: int) -> None:
                     ui.label(detail).classes("text-xs font-mono opacity-70")
 
 
-def _render_submission_checklist_tab(
+def _render_drafting_commitments(
     proposal_id: int,
     *,
-    on_state_change=None,
+    hide_obtained: bool,
+    on_change,
 ) -> None:
+    """Render user-captured drafting commitments independently of matrix rows.
+
+    A proposal can legitimately have commitments without any compliance items
+    classified as ``mandatory_form`` or ``certification``.  Keeping this block
+    independent prevents the manual-checklist empty state from hiding those
+    commitments.
+    """
+    from app.services.submission_commitments import (
+        add_submission_commitment,
+        delete_commitment,
+        list_submission_commitments,
+        set_commitment_obtained,
+        update_commitment,
+    )
+
+    def _toggle_commitment(pk: int, value: bool) -> None:
+        set_commitment_obtained(pk, value)
+        on_change()
+
+    def _open_commitment_editor(commitment: dict | None = None) -> None:
+        is_edit = commitment is not None
+        current = commitment or {}
+        with ui.dialog() as dialog, ui.card().classes(
+            "w-full max-w-xl"
+        ):
+            ui.label(
+                "Edit commitment" if is_edit else "Add commitment"
+            ).classes("text-base font-medium")
+            ui.label(
+                "Track an artifact or deliverable that must be ready with "
+                "the final submission package."
+            ).classes("text-xs opacity-60")
+            description_input = ui.textarea(
+                "Commitment",
+                value=current.get("description") or "",
+                placeholder=(
+                    "e.g., Export the approved transition evidence matrix"
+                ),
+            ).classes("w-full").props("autogrow rows=3")
+            notes_input = ui.textarea(
+                "Notes (optional)",
+                value=current.get("notes") or "",
+                placeholder="Owner, location, due date, or final export step",
+            ).classes("w-full").props("autogrow rows=2")
+
+            with ui.row().classes("w-full justify-end gap-2 pt-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+
+                def _save() -> None:
+                    description = (
+                        description_input.value or ""
+                    ).strip()
+                    if not description:
+                        ui.notify(
+                            "Commitment is required.", type="warning"
+                        )
+                        return
+                    notes = (notes_input.value or "").strip()
+                    if is_edit:
+                        ok = update_commitment(
+                            int(current["id"]),
+                            description=description,
+                            notes=notes,
+                        )
+                        if not ok:
+                            ui.notify(
+                                "Could not update commitment.",
+                                type="negative",
+                            )
+                            return
+                        message = "Commitment updated."
+                    else:
+                        add_submission_commitment(
+                            proposal_id=proposal_id,
+                            description=description,
+                            source="manual",
+                            notes=notes or None,
+                        )
+                        message = "Commitment added."
+                    dialog.close()
+                    ui.notify(message, type="positive")
+                    on_change()
+
+                ui.button(
+                    "Save", icon="save", on_click=_save
+                ).props("color=primary")
+        dialog.open()
+
+    def _confirm_remove(commitment: dict) -> None:
+        with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
+            ui.label("Remove commitment?").classes(
+                "text-base font-medium"
+            )
+            ui.label(commitment["description"]).classes(
+                "text-sm opacity-80"
+            )
+            ui.label(
+                "This removes only the checklist record; it does not "
+                "change proposal draft text."
+            ).classes("text-xs opacity-60")
+            with ui.row().classes("w-full justify-end gap-2 pt-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+
+                def _remove() -> None:
+                    ok = delete_commitment(int(commitment["id"]))
+                    dialog.close()
+                    if ok:
+                        ui.notify("Commitment removed.", type="positive")
+                        on_change()
+                    else:
+                        ui.notify(
+                            "Could not remove commitment.", type="negative"
+                        )
+
+                ui.button(
+                    "Remove", icon="delete", on_click=_remove
+                ).props("color=negative")
+        dialog.open()
+
+    commits = list_submission_commitments(proposal_id)
+    with ui.row().classes("items-center w-full gap-2 pt-6"):
+        ui.label("Drafting commitments").classes(
+            "text-base font-medium"
+        )
+        ui.element("div").classes("flex-1")
+        ui.button(
+            "Add commitment",
+            icon="add",
+            on_click=lambda: _open_commitment_editor(),
+        ).props("flat dense color=primary")
+    ui.label(
+        "Artifacts the proposal volunteered to deliver. Add one here "
+        "or capture it from a Provide-value dialog, then tick obtained "
+        "as you gather it."
+    ).classes("text-xs opacity-60 pb-2")
+    if not commits:
+        ui.label("No user-tracked commitments yet.").classes(
+            "text-sm opacity-60 py-3"
+        )
+        return
+
+    visible_commits = (
+        [c for c in commits if not c["obtained"]]
+        if hide_obtained
+        else commits
+    )
+    if not visible_commits:
+        ui.label(
+            "All commitments obtained — fully gathered."
+        ).classes("text-sm font-medium text-green-700 py-4")
+    for c in visible_commits:
+        with ui.card().classes(
+            "w-full bg-emerald-50/40 border-l-4 border-emerald-300"
+            + (" opacity-60" if c["obtained"] else "")
+        ):
+            with ui.row().classes("items-start w-full gap-3"):
+                commitment_checkbox = ui.checkbox(
+                    "", value=c["obtained"],
+                    on_change=lambda e, pk=c["id"]: _toggle_commitment(
+                        pk, e.value,
+                    ),
+                ).props("size=md")
+                commitment_checkbox.props["aria-label"] = (
+                    f"Obtained status for drafting commitment {c['id']}: "
+                    f"{c['description']}"
+                )
+                with ui.column().classes("gap-0 flex-1"):
+                    ui.label(c["description"]).classes(
+                        "text-sm font-medium"
+                        + (" line-through" if c["obtained"] else "")
+                    )
+                    src_label = {
+                        "needs_human_apply": "from a placeholder resolution",
+                        "manual": "manually added",
+                        "draft_extraction": "auto-extracted from draft",
+                    }.get(c["source"], c["source"])
+                    ui.label(
+                        f"Source: {src_label}"
+                        + (
+                            f"  ·  Section pk #{c['source_section_id']}"
+                            if c["source_section_id"] else ""
+                        )
+                    ).classes("text-xs opacity-60")
+                    if c["notes"]:
+                        ui.label(f"Notes: {c['notes']}").classes(
+                            "text-xs italic opacity-70 pt-1"
+                        )
+                with ui.column().classes("gap-1 items-stretch"):
+                    ui.button(
+                        "Edit",
+                        icon="edit",
+                        on_click=lambda item=c: _open_commitment_editor(item),
+                    ).props("flat dense size=sm color=blue-grey-7")
+                    ui.button(
+                        "Remove",
+                        icon="delete_outline",
+                        on_click=lambda item=c: _confirm_remove(item),
+                    ).props("flat dense size=sm color=red-7")
+
+
+def _render_submission_checklist_tab(
+    proposal_id: int, *, on_state_change=None,
+):
     """Submission Checklist tab — interactive checklist of items the user
     needs to attach/submit for the proposal package.
 
@@ -95,10 +300,7 @@ def _render_submission_checklist_tab(
     state: dict = {"hide_obtained": False}
 
     def _toggle_obtained(item_pk: int, value: bool) -> None:
-        with session_scope() as db:
-            ci = db.get(ComplianceMatrixItem, item_pk)
-            if ci is not None:
-                ci.submission_obtained = value
+        set_rfp_required_item_obtained(item_pk, value)
 
     def _after_change() -> None:
         render.refresh()
@@ -155,6 +357,11 @@ def _render_submission_checklist_tab(
                 "categories — check the Compliance tab.",
                 icon="checklist",
             )
+            _render_drafting_commitments(
+                proposal_id,
+                hide_obtained=state["hide_obtained"],
+                on_change=_after_change,
+            )
             return
 
         n_total = len(snapshot)
@@ -191,11 +398,9 @@ def _render_submission_checklist_tab(
 
         rows = [s for s in snapshot if not s["obtained"]] if state["hide_obtained"] else snapshot
         if not rows:
-            ui.label("All items obtained — checklist complete.").classes(
-                "text-sm font-medium text-green-700 py-4"
-            )
-            return
-
+            ui.label(
+                "All items obtained — checklist complete."
+            ).classes("text-sm font-medium text-green-700 py-4")
         for s in rows:
             with ui.card().classes("w-full" + (" opacity-60" if s["obtained"] else "")):
                 with ui.row().classes("items-start w-full gap-3"):
@@ -216,78 +421,17 @@ def _render_submission_checklist_tab(
                         ui.label(meta).classes("text-xs font-mono opacity-60")
                         ui.label(f"Source: {s['source']}").classes("text-xs opacity-60")
 
-        # ---- Drafting commitments ---------------------------------------
-        # User-flagged "we will deliver X" items captured from the
-        # Provide-value placeholder dialog (or future agent extraction).
-        # Lives in the submission_commitments table, not the matrix.
-        from app.services.submission_commitments import (
-            delete_commitment,
-            list_submission_commitments,
-            set_commitment_obtained,
+        # Drafting commitments are independent of matrix-derived checklist
+        # rows and therefore render whether or not this proposal has any.
+        _render_drafting_commitments(
+            proposal_id,
+            hide_obtained=state["hide_obtained"],
+            on_change=_after_change,
         )
 
-        def _toggle_commitment(pk: int, value: bool) -> None:
-            set_commitment_obtained(pk, value)
-
-        def _remove_commitment(pk: int) -> None:
-            if delete_commitment(pk):
-                ui.notify("Commitment removed.", type="positive")
-                render.refresh()
-                if on_state_change is not None:
-                    on_state_change()
-
-        commits = list_submission_commitments(proposal_id)
-        if commits:
-            ui.label("Drafting commitments").classes("text-base font-medium pt-6")
-            ui.label(
-                "Artifacts the proposal volunteered to deliver, captured "
-                "when you ticked 'Add to Submission Checklist' in a "
-                "Provide-value dialog. Tick obtained as you gather each "
-                "one; Remove if a commitment is no longer in the draft."
-            ).classes("text-xs opacity-60 pb-2")
-            visible_commits = [c for c in commits if not c["obtained"]] if state["hide_obtained"] else commits
-            if not visible_commits:
-                ui.label("All commitments obtained — fully gathered.").classes(
-                    "text-sm font-medium text-green-700 py-4"
-                )
-            for c in visible_commits:
-                with ui.card().classes(
-                    "w-full bg-emerald-50/40 border-l-4 border-emerald-300"
-                    + (" opacity-60" if c["obtained"] else "")
-                ):
-                    with ui.row().classes("items-start w-full gap-3"):
-                        ui.checkbox(
-                            "",
-                            value=c["obtained"],
-                            on_change=lambda e, pk=c["id"]: (
-                                _toggle_commitment(pk, e.value),
-                                _after_change(),
-                            ),
-                        ).props("size=md")
-                        with ui.column().classes("gap-0 flex-1"):
-                            ui.label(c["description"]).classes(
-                                "text-sm font-medium" + (" line-through" if c["obtained"] else "")
-                            )
-                            src_label = {
-                                "needs_human_apply": "from a placeholder resolution",
-                                "manual": "manually added",
-                                "draft_extraction": "auto-extracted from draft",
-                            }.get(c["source"], c["source"])
-                            ui.label(
-                                f"Source: {src_label}"
-                                + (
-                                    f"  ·  Section pk #{c['source_section_id']}"
-                                    if c["source_section_id"]
-                                    else ""
-                                )
-                            ).classes("text-xs opacity-60")
-                            if c["notes"]:
-                                ui.label(f"Notes: {c['notes']}").classes("text-xs italic opacity-70 pt-1")
-                        ui.button(
-                            icon="close",
-                            on_click=lambda pk=c["id"]: _remove_commitment(pk),
-                        ).props("flat dense round size=sm color=red-7").tooltip(
-                            "Remove this commitment from the checklist. (Doesn't change the draft text.)"
-                        )
-
     render()
+    # The proposal page uses this callback to keep this tab's deterministic
+    # readiness snapshot current when another tab mutates proposal state
+    # (for example, resolving a Draft placeholder). ``getattr`` preserves the
+    # plain-function test double used by unit tests.
+    return getattr(render, "refresh", render)

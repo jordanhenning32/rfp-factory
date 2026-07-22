@@ -92,8 +92,8 @@ def _render_findings_tab(
     *,
     on_state_change=None,
 ) -> None:
-    """Reviewer Findings tab — Reviewer A (Opus, compliance) + Reviewer B
-    (Gemini, persuasion) findings grouped by section. Each finding has
+    """Reviewer Findings tab — Reviewer A (compliance) + Reviewer B
+    (persuasion) findings grouped by section. Each finding has
     Accept / Dismiss / Unmark actions. Per-section: Apply accepted findings
     (regenerates with findings as a directive), Re-run reviewer.
 
@@ -112,9 +112,9 @@ def _render_findings_tab(
         is_running as _job_is_running,
     )
 
-    # Default-hide accepted / dismissed / auto-resolved findings — they're
-    # already addressed and the user just needs to act on the pending ones.
-    # The badge shows pending count; the rendered list now matches it.
+    # Default-hide dismissed / auto-resolved findings. Pending findings need
+    # triage and accepted-but-unresolved findings still need Apply + follow-up
+    # review, so both remain visible and are included in the tab badge.
     state = {"show_all": False}
 
     def _after_change() -> None:
@@ -229,9 +229,13 @@ def _render_findings_tab(
             for f in findings
             if not f["accepted_at"] and not f["dismissed_at"] and f["resolved_in_pass_number"] is None
         )
-        n_accepted = sum(1 for f in findings if f["accepted_at"])
+        n_accepted = sum(
+            1 for f in findings
+            if f["accepted_at"] and f["resolved_in_pass_number"] is None
+        )
         n_dismissed = sum(1 for f in findings if f["dismissed_at"])
         n_resolved = sum(1 for f in findings if f["resolved_in_pass_number"] is not None)
+        n_actions = n_pending + n_accepted
         n_critical_pending = sum(
             1
             for f in findings
@@ -248,19 +252,22 @@ def _render_findings_tab(
                     if state["show_all"]:
                         title_text = f"{n_total} finding{'s' if n_total != 1 else ''}"
                     else:
-                        title_text = f"{n_pending} pending finding{'s' if n_pending != 1 else ''}"
+                        title_text = (
+                            f"{n_actions} action"
+                            f"{'s' if n_actions != 1 else ''} remaining"
+                        )
                     ui.label(title_text).classes("text-base font-semibold")
                     parts = [
                         f"{n_pending} pending",
-                        f"{n_accepted} accepted",
+                        f"{n_accepted} accepted to apply",
                         f"{n_dismissed} dismissed",
                     ]
                     if n_resolved:
                         parts.append(f"{n_resolved} resolved")
                     ui.label(" · ".join(parts)).classes("text-xs opacity-70")
                 with ui.row().classes("gap-2 items-center"):
-                    # Show-all toggle. Default OFF — only pending cards
-                    # render below, matching the badge count.
+                    # Show-all toggle. Default OFF — pending and accepted-
+                    # to-apply cards render below, matching the badge count.
                     ui.switch(
                         "Show all",
                         value=state["show_all"],
@@ -523,7 +530,11 @@ def _render_findings_tab(
                 for f in sec_findings_for_pk
                 if not f["accepted_at"] and not f["dismissed_at"] and f["resolved_in_pass_number"] is None
             )
-            n_acc = sum(1 for f in sec_findings_for_pk if f["accepted_at"])
+            n_acc = sum(
+                1 for f in sec_findings_for_pk
+                if f["accepted_at"]
+                and f["resolved_in_pass_number"] is None
+            )
             # Bucket: 0 = needs user attention (pending), 1 = needs Apply
             # click (accepted, no pending), 2 = fully addressed.
             if n_pend > 0:
@@ -545,7 +556,11 @@ def _render_findings_tab(
                 for f in sec_findings
                 if not f["accepted_at"] and not f["dismissed_at"] and f["resolved_in_pass_number"] is None
             )
-            n_sec_accepted = sum(1 for f in sec_findings if f["accepted_at"])
+            n_sec_accepted = sum(
+                1 for f in sec_findings
+                if f["accepted_at"]
+                and f["resolved_in_pass_number"] is None
+            )
 
             # Default view: hide sections that have nothing to act on.
             # "Actions remaining" = pending findings to triage OR accepted

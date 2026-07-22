@@ -33,6 +33,7 @@ from app.services.amendments import (
     AmendmentApplyReport,
     apply_amendment_delta,
 )
+from app.services.proposal_access import ensure_proposal_mutable
 from app.services.stages import record_stage as _set_stage
 
 log = logging.getLogger(__name__)
@@ -54,13 +55,13 @@ def _delta_touches_evaluation_criteria(
     """Substring heuristic: did the amendment likely change Section M?
 
     Trigger conditions:
-      - any new_item with category == 'evaluation_criterion'
+      - any new_item with requirement_type == 'evaluation_criterion'
       - any modified_item whose new_text or change_summary contains
         'evaluation factor' / 'section m' / 'scoring'
     Returns False otherwise.
     """
     for item in delta.new_items:
-        if (item.category or "").lower() == "evaluation_criterion":
+        if (item.requirement_type or "").lower() == "evaluation_criterion":
             return True
     for mod in delta.modified_items:
         blob = " ".join(
@@ -73,6 +74,21 @@ def _delta_touches_evaluation_criteria(
             if substr in blob:
                 return True
     return False
+
+
+def _require_complete_amendment_extraction(
+    delta: ComplianceExtractionResult,
+) -> dict:
+    """Fail closed before any amendment mutations when source coverage is incomplete."""
+
+    coverage = delta.coverage_as_public_dict()
+    if not delta.extraction_complete:
+        reasons = ", ".join(coverage.get("incomplete_reasons") or []) or "unknown"
+        raise RuntimeError(
+            "Amendment extraction coverage is "
+            f"{coverage.get('state') or 'incomplete'} ({reasons}); no changes were applied."
+        )
+    return coverage
 
 
 def run_amendment_ingestion(
@@ -104,7 +120,11 @@ def run_amendment_ingestion(
 
     # --- 1. Insert audit row ---
     amendment_run_id: int | None = None
+    extraction_coverage: dict | None = None
     with session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="run amendment ingestion",
+        )
         doc = db.get(RfpPackageDocument, document_id)
         if doc is None:
             raise ValueError(f"document {document_id} not found")
@@ -160,6 +180,8 @@ def run_amendment_ingestion(
             existing_items=existing_items,
             delta_mode=True,
         )
+        extraction_coverage = delta.coverage_as_public_dict()
+        _require_complete_amendment_extraction(delta)
 
         # --- 5. Apply delta ---
         with session_scope() as db:
@@ -220,6 +242,10 @@ def run_amendment_ingestion(
                     run_row.status = "failed"
                     run_row.completed_at = datetime.now(UTC)
                     run_row.error_text = str(exc)[:2000]
+                    if extraction_coverage is not None:
+                        run_row.report_json = json.dumps(
+                            {"extraction_coverage": extraction_coverage}
+                        )
         except Exception:
             log.exception(
                 "amendment: failed to persist 'failed' status on run %s",
@@ -228,6 +254,7 @@ def run_amendment_ingestion(
         _set_stage(
             proposal_id,
             f"Amendment {filename} failed — check logs.",
+            status="failed",
         )
         raise
 

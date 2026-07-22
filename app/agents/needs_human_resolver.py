@@ -10,10 +10,10 @@ and decides — per marker — whether the answer is derivable.
 
 Three actions per marker:
   edit    — the answer IS in the cached context; fill it in
-            verbatim. Example: marker is 'Brendan Martin email',
+            verbatim. Example: marker is 'Jamie Chen email',
             and key_personnel has it; resolver fills the email.
   reject  — the marker is a SUBMISSION CHECKLIST item that
-            shouldn't appear in narrative ("verify NC E-Procurement
+            shouldn't appear in narrative ("verify buyer-portal
             registration before submission", "attach final hosting
             agreement"). Removing the marker leaves clean prose;
             the user tracks the actual verification on the
@@ -145,7 +145,7 @@ _SYSTEM = """You are the Needs Human Resolver. After the Writer Team drafts a pr
 
 THREE ACTIONS:
 - edit: the answer IS in the cached context. Fill it in with a concrete value sourced verbatim from the context. The orchestrator will replace the [NEEDS_HUMAN] marker in the draft with your value.
-- reject: the marker is a SUBMISSION CHECKLIST item that doesn't belong in narrative — pre-flight verifications ('verify NC E-Procurement registration before submission'), final-package attachments ('attach hosting agreement appendix'), executed-teaming confirmations that shouldn't appear inline, etc. Removing the marker leaves clean prose; the user tracks the actual verification on the Submission Checklist tab.
+- reject: the marker is a SUBMISSION CHECKLIST item that doesn't belong in narrative — pre-flight verifications ('verify buyer-portal registration before submission'), final-package attachments ('attach hosting agreement appendix'), executed-teaming confirmations that shouldn't appear inline, etc. Removing the marker leaves clean prose; the user tracks the actual verification on the Submission Checklist tab.
 - skip: the answer genuinely needs human judgment. Default to this when:
     * The cached context doesn't unambiguously supply a value
     * The marker asks for a customer-specific quote / testimonial / endorsement
@@ -160,21 +160,21 @@ CRITICAL DISCIPLINE — false positives are MUCH worse than false negatives:
 
 EXAMPLES:
 
-  Marker: "Brendan Martin email"
-  Context: company_profile.key_personnel has Brendan Martin with no email field.
-  Decision: action=skip, reason="key_personnel entry for Brendan Martin has no email field; user must supply".
+  Marker: "Jamie Chen email"
+  Context: company_profile.key_personnel has Jamie Chen with no email field.
+  Decision: action=skip, reason="key_personnel entry for Jamie Chen has no email field; user must supply".
 
-  Marker: "Brendan Martin email"
-  Context: key_personnel has Brendan Martin with email=brendan@quadraticdigital.com.
-  Decision: action=edit, value="brendan@quadraticdigital.com", reason="from company_profile.key_personnel.email".
+  Marker: "Jamie Chen email"
+  Context: key_personnel has Jamie Chen with email=jamie.chen@example.invalid.
+  Decision: action=edit, value="jamie.chen@example.invalid", reason="from company_profile.key_personnel.email".
 
-  Marker: "verify NC E-Procurement registration and fee currency before submission"
+  Marker: "verify buyer-portal registration before submission"
   Context: any.
   Decision: action=reject, reason="pre-flight registration check belongs on Submission Checklist, not narrative".
 
-  Marker: "confirm K-12 student-data-privacy SME engagement (named partner or individual) before submission"
-  Context: profile has no K-12 SME named.
-  Decision: action=skip, reason="profile does not name a K-12 student-data-privacy SME; partner / individual must be confirmed by the user".
+  Marker: "confirm specialist engagement (named partner or individual) before submission"
+  Context: profile has no relevant specialist named.
+  Decision: action=skip, reason="profile does not name the required specialist; partner / individual must be confirmed by the user".
 
   Marker: "year-1 / year-3 / year-5 concurrent-user projections"
   Context: cost build doesn't have user projections; RFP excerpt would but isn't in cached context.
@@ -188,9 +188,9 @@ EXAMPLES:
   Context: approved team roster has Project Manager at 50% time.
   Decision: action=edit, value="50% of full-time over the period of performance", reason="from approved team roster's Project Manager allocation".
 
-  Marker: "AWS GovCloud reseller margin and Microsoft license assumptions"
-  Context: cost build has 'AWS GovCloud hosting: $72,000/yr' as ODC; nothing about reseller margin or Microsoft licensing.
-  Decision: action=skip, reason="cost build has the AWS hosting amount but neither reseller margin nor Microsoft licensing assumptions; user must supply".
+  Marker: "cloud-hosting reseller margin and license assumptions"
+  Context: cost build has 'Cloud hosting: $60,000/year' as an ODC; nothing about reseller margin or licensing.
+  Decision: action=skip, reason="cost build has the hosting amount but neither reseller margin nor licensing assumptions; user must supply".
 
 OUTPUT — call report_resolutions with one decision per input marker. Every input marker_text MUST appear in your output exactly once. Match the input strings verbatim — the orchestrator does literal string match."""
 

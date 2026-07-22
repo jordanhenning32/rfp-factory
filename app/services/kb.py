@@ -10,15 +10,24 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from app.config import KB_DIR
 from app.core.enums import KbDocumentClass, KbDocumentStatus
 from app.models import KnowledgeBaseDocument, ProfileSuggestion
+from app.services.deletion_quarantine import stage_path_for_transaction
+from app.services.storage_safety import (
+    UnsafeManagedPath,
+    require_contained_file,
+    require_owned_direct_child_directory,
+)
 
 log = logging.getLogger(__name__)
 
@@ -81,12 +90,46 @@ def _validate_upload_extensions(files: list[KbUploadedFile]) -> None:
             raise ValueError(f"{f.filename} has unsupported file type {suffix or '(none)'}; allowed: {allowed}.")
 
 
-def _path_is_within(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False
-    return True
+
+def _register_kb_rollback_cleanup(db: Session, document_dir: Path) -> None:
+    state = {"committed": False}
+
+    def _after_commit(_session: Session) -> None:
+        state["committed"] = True
+
+    def _after_rollback(_session: Session) -> None:
+        if state["committed"]:
+            return
+        try:
+            safe_dir = require_owned_direct_child_directory(
+                document_dir,
+                root=KB_DIR,
+                expected_name=document_dir.name,
+                description="rolled-back KB document directory",
+            )
+            if safe_dir.exists():
+                shutil.rmtree(safe_dir)
+        except UnsafeManagedPath as exc:
+            log.error("refusing KB rollback cleanup for %s: %s", document_dir, exc)
+        except Exception:
+            log.exception("failed KB rollback cleanup for %s", document_dir)
+
+    event.listen(db, "after_commit", _after_commit, once=True)
+    event.listen(db, "after_rollback", _after_rollback, once=True)
+
+
+def _purge_quarantined_kb_file(path: Path, *, managed_root: Path) -> None:
+    """Purge one staged KB file and remove its now-empty owned directory."""
+    path.unlink()
+    parent = path.parent
+    resolved_root = managed_root.expanduser().resolve(strict=False)
+    if (
+        parent != resolved_root
+        and parent.exists()
+        and parent.is_dir()
+        and not any(parent.iterdir())
+    ):
+        parent.rmdir()
 
 
 def find_duplicate_documents(
@@ -181,6 +224,7 @@ def create_kb_documents(
 
         doc_dir = KB_DIR / str(doc.id)
         doc_dir.mkdir(parents=True, exist_ok=True)
+        _register_kb_rollback_cleanup(db, doc_dir)
         path = doc_dir / _safe_filename(f.filename)
         path.write_bytes(f.content)
         doc.storage_path = str(path)
@@ -195,35 +239,53 @@ def delete_kb_document(db: Session, document_id: int) -> dict:
     if doc is None:
         return {"deleted": False, "reason": "not_found"}
 
+    # Validate the database-sourced path before deleting suggestions or the
+    # document row. Missing files are safe to recover from, but paths outside
+    # the active KB workspace (or the workspace root itself) fail closed.
+    try:
+        storage_path = require_contained_file(
+            doc.storage_path,
+            root=KB_DIR,
+            description="KB storage path",
+            expected_parent_name=str(doc.id),
+        )
+    except UnsafeManagedPath as exc:
+        return {"deleted": False, "reason": str(exc)}
+
+    result = {"deleted": True}
+    quarantine_path = storage_path.with_name(
+        f".delete-kb-{doc.id}-{uuid4().hex}"
+    )
+    managed_root = KB_DIR
+    document_dir_name = str(doc.id)
+    stage_error = stage_path_for_transaction(
+        db,
+        original_path=storage_path,
+        quarantine_path=quarantine_path,
+        validate_quarantine=lambda path: require_contained_file(
+            path,
+            root=managed_root,
+            description="quarantined KB storage path",
+            expected_parent_name=document_dir_name,
+        ),
+        purge_quarantine=lambda path: _purge_quarantined_kb_file(
+            path,
+            managed_root=managed_root,
+        ),
+        result=result,
+        description="KB document storage",
+        logger=log,
+    )
+    if stage_error is not None:
+        return {"deleted": False, "reason": stage_error}
+
     # ProfileSuggestion has FK CASCADE on the doc; explicit cleanup belt-and-suspenders.
     suggestions = db.query(ProfileSuggestion).filter(ProfileSuggestion.kb_document_id == document_id).count()
     db.query(ProfileSuggestion).filter(ProfileSuggestion.kb_document_id == document_id).delete(
         synchronize_session=False
     )
 
-    storage_path = Path(doc.storage_path) if doc.storage_path else None
-
     db.delete(doc)
     db.flush()
-
-    # Filesystem
-    if storage_path:
-        try:
-            expected_dir = (KB_DIR / str(document_id)).resolve()
-            resolved_storage_path = storage_path.resolve()
-            if not _path_is_within(storage_path, KB_DIR) or not _path_is_within(storage_path, expected_dir):
-                log.error(
-                    "refusing to remove unexpected KB storage path for document %s: %s (expected under %s)",
-                    document_id,
-                    storage_path,
-                    expected_dir,
-                )
-                return {"deleted": True, "suggestions_removed": suggestions}
-            if resolved_storage_path.exists() and resolved_storage_path.is_file():
-                resolved_storage_path.unlink()
-            if expected_dir.exists() and expected_dir.is_dir() and not any(expected_dir.iterdir()):
-                expected_dir.rmdir()
-        except Exception:
-            log.exception("failed to clean up KB file %s", storage_path)
-
-    return {"deleted": True, "suggestions_removed": suggestions}
+    result["suggestions_removed"] = suggestions
+    return result

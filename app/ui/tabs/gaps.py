@@ -21,13 +21,14 @@ import logging
 from nicegui import ui
 from sqlalchemy import select
 
-from app.db.session import SessionLocal, session_scope
+from app.db.session import SessionLocal
 from app.models import ComplianceMatrixItem, GapAnalysis
 from app.services.framing import (
     apply_framing_to_unaddressed_gaps,
     get_framing,
     pick_mitigation_for_framing,
     set_framing,
+    update_gap_resolution,
 )
 from app.ui._shared import _empty_state
 
@@ -657,21 +658,16 @@ def _set_gap_resolution(
     If selected_index changes WITHOUT a paired selected_partner, the partner
     is auto-cleared (different mitigation = different partner suggestions).
     """
-    with session_scope() as db:
-        g = db.get(GapAnalysis, gap_pk)
-        if g is None:
-            return
-        if selected_index is not _UNSET:
-            old_index = g.selected_mitigation_index
-            g.selected_mitigation_index = selected_index
-            if selected_partner is _UNSET and old_index != selected_index:
-                g.selected_partner_name = None
-        if selected_partner is not _UNSET:
-            g.selected_partner_name = selected_partner
-        if resolved is not _UNSET:
-            g.resolved = bool(resolved)
-        if notes is not _UNSET:
-            g.resolution_notes = notes
+    fields = {}
+    if selected_index is not _UNSET:
+        fields["selected_index"] = selected_index
+    if selected_partner is not _UNSET:
+        fields["selected_partner"] = selected_partner
+    if resolved is not _UNSET:
+        fields["resolved"] = resolved
+    if notes is not _UNSET:
+        fields["notes"] = notes
+    update_gap_resolution(gap_pk, **fields)
 
 
 def _render_gaps_tab(
@@ -1364,8 +1360,6 @@ def _render_gap_card(g: dict, *, proposal_id: int, on_change) -> None:
 
                         def save_notes() -> None:
                             text = (ta.value or "").strip() or None
-                            _set_gap_resolution(gap_pk=pk, notes=text)
-
                             saved_decision = None
                             if remember_cb.value:
                                 topic = (topic_input.value or "").strip()
@@ -1381,6 +1375,14 @@ def _render_gap_card(g: dict, *, proposal_id: int, on_change) -> None:
                                         type="warning",
                                     )
                                     return
+
+                            # Validate the optional cross-RFP capture before
+                            # mutating proposal-local notes. A failed topic or
+                            # empty-note validation must leave both stores
+                            # unchanged while the dialog remains open.
+                            _set_gap_resolution(gap_pk=pk, notes=text)
+
+                            if remember_cb.value:
                                 from app.core.decisions import add_decision
 
                                 result = add_decision(

@@ -11,6 +11,7 @@ extraction happens after the user clicks Run.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -44,7 +45,7 @@ def _build_prompt(text: str) -> str:
 
 {{
   "title": "Concise proposal title or solicitation subject (e.g., 'Website Design and Configuration Services'). Not the agency name; the work being procured.",
-  "agency": "Issuing agency or department name (e.g., 'Pennsylvania Department of Aging', 'Centers for Medicare & Medicaid Services')",
+  "agency": "Issuing agency or department name (e.g., 'Example State Department')",
   "solicitation_number": "RFP / IFB / RFQ / contract number as printed (e.g., 'RFP 758 2600000258'). Null if not present.",
   "naics": "Primary NAICS code as a 6-digit string (e.g., '541511'). Null if not stated.",
   "due_date": "Proposal submission deadline in YYYY-MM-DD format. Convert from any source format. Null if relative ('30 days from issue') or absent.",
@@ -109,13 +110,22 @@ def _parse_response(raw: str) -> ExtractedMetadata:
     # Take the first {...} block — defensive against pre/post chatter.
     brace_match = re.search(r"\{.*\}", candidate, re.DOTALL)
     if not brace_match:
-        log.warning("metadata extractor: no JSON object found in response: %r", raw[:200])
+        log.warning(
+            "metadata extractor: no JSON object found (len=%d, sha256=%s)",
+            len(raw),
+            hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        )
         return ExtractedMetadata()
 
     try:
         data = json.loads(brace_match.group(0))
     except json.JSONDecodeError:
-        log.warning("metadata extractor: JSON parse failed: %r", brace_match.group(0)[:200])
+        malformed = brace_match.group(0)
+        log.warning(
+            "metadata extractor: JSON parse failed (len=%d, sha256=%s)",
+            len(malformed),
+            hashlib.sha256(malformed.encode("utf-8")).hexdigest(),
+        )
         return ExtractedMetadata()
 
     if not isinstance(data, dict):

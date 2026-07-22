@@ -1,5 +1,5 @@
 """Test the compliance validator's apply-corrections logic without
-actually calling Haiku. Monkeypatch validate_compliance_items to
+actually calling a provider. Monkeypatch the coverage-aware validator to
 return synthetic ValidationResults at each confidence level, then
 verify _validate_and_apply_corrections mutates (or doesn't) the
 ExtractedComplianceItem objects correctly.
@@ -8,7 +8,10 @@ ExtractedComplianceItem objects correctly.
 from unittest import mock
 
 from app.agents.compliance_matrix import ExtractedComplianceItem
-from app.agents.compliance_validator import ValidationResult
+from app.agents.compliance_validator import (
+    ComplianceValidationReport,
+    ValidationResult,
+)
 
 
 def main():
@@ -103,8 +106,20 @@ def main():
 
     from app.jobs import intake as intake_mod
 
+    fake_report = ComplianceValidationReport(
+        total_count=len(items),
+        primary_model="gemini-2.5-pro",
+        fallback_model="claude-haiku-4-5-20251001",
+        findings=fake_results,
+        reviewed_requirement_ids=[item.requirement_id for item in items],
+    )
+
     with (
-        mock.patch.object(intake_mod, "validate_compliance_items", return_value=fake_results),
+        mock.patch.object(
+            intake_mod,
+            "validate_compliance_items_report",
+            return_value=fake_report,
+        ),
         mock.patch.object(intake_mod, "_set_stage"),
     ):
         # Use a fake proposal_id (-1) that won't match any real row;

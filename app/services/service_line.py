@@ -7,9 +7,10 @@ scenarios → Cost Reviewer dual pass → Cost Writer narrating labor
 totals). Adding a new category like `payment_systems` (card processing,
 ACH/EFT, recurring billing, donation processing, hospital financing)
 swaps the cost flow to a fee-schedule narrative drawn from
-data/pricing/<service_line>.json + _<service_line>_context.json,
-and skips the Cost Analyst / Cost Reviewer entirely (no labor build
-to make).
+data/pricing/<service_line>.json + _<service_line>_context.json. It
+skips the labor-based Cost Analyst (there is no labor build), then runs
+the payment-specific Cost Reviewer after the Cost Writer drafts the fee
+narrative.
 
 Adding a NEW service line in the future is a registry change — add a
 key to SERVICE_LINES below + drop the matching JSON files in
@@ -20,14 +21,34 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.config import DATA_DIR
 from app.db.session import session_scope
 from app.models import Proposal
+from app.services.proposal_access import (
+    acquire_proposal_write_fence,
+    ensure_proposal_mutable,
+    proposal_write_lock,
+)
 
 log = logging.getLogger(__name__)
+
+_payment_cost_basis_mutex = threading.RLock()
+
+
+@contextmanager
+def payment_cost_basis_lock() -> Iterator[None]:
+    """Serialize reads/commits that must agree on the shared cost basis."""
+    with _payment_cost_basis_mutex:
+        yield
 
 
 # Canonical service-line ID constants. Use these everywhere instead
@@ -117,14 +138,15 @@ SERVICE_LINES: dict[str, dict[str, Any]] = {
             "Payment-processing RFPs — card processing, ACH/EFT, "
             "recurring billing, donation processing, subscription "
             "billing, hospital financing, and similar. Uses "
-            "fee-schedule cost build (skips Cost Analyst; Cost "
-            "Writer renders directly from data/pricing/"
-            "payment_systems.json + _payment_systems_context.json)."
+            "fee-schedule cost build (skips the labor-based Cost "
+            "Analyst; Cost Writer renders directly from data/pricing/"
+            "payment_systems.json + _payment_systems_context.json, then "
+            "the payment-specific Cost Reviewer fact-checks the narrative)."
         ),
         "uses_labor_catalog": False,
         "uses_payment_fee_schedule": True,
         "shows_cost_analyst": False,
-        "shows_cost_reviewer": False,
+        "shows_cost_reviewer": True,
         "pricing_data_path": "data/pricing/payment_systems.json",
         "context_data_path": "data/pricing/_payment_systems_context.json",
     },
@@ -164,7 +186,9 @@ def set_service_line(proposal_id: int, value: str) -> str:
     if target not in SERVICE_LINES:
         raise ValueError(f"unknown service_line {value!r}; expected one of {list(SERVICE_LINES.keys())}")
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="change proposal service line",
+        )
         if p is None:
             raise ValueError(f"proposal {proposal_id} not found")
         p.service_line = target
@@ -198,11 +222,8 @@ def load_payment_systems_context() -> dict[str, Any]:
 
 
 def _load_json_at(rel_path: str) -> dict[str, Any]:
-    """Load a JSON file relative to the project root. Project root is
-    the parent of the `app/` package — derived from this file's path
-    so it works regardless of cwd when the app is launched."""
-    project_root = Path(__file__).resolve().parents[2]
-    full = project_root / rel_path
+    """Load a JSON file from the active data workspace."""
+    full = _active_data_path(rel_path)
     try:
         return json.loads(full.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -211,6 +232,14 @@ def _load_json_at(rel_path: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         log.exception("service_line data file invalid JSON: %s", full)
         return {}
+
+
+def _active_data_path(rel_path: str) -> Path:
+    """Map legacy ``data/...`` registry paths beneath active ``DATA_DIR``."""
+    relative = Path(rel_path)
+    if relative.parts and relative.parts[0].lower() == "data":
+        relative = Path(*relative.parts[1:])
+    return DATA_DIR / relative
 
 
 def list_payment_pricing_models() -> list[dict[str, str]]:
@@ -285,7 +314,9 @@ def set_selected_pricing_model(
                 f"{[m['id'] for m in PAYMENT_PRICING_MODELS]}"
             )
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="select payment pricing model",
+        )
         if p is None:
             raise ValueError(f"proposal {proposal_id} not found")
         p.selected_pricing_model = target
@@ -313,6 +344,7 @@ def get_payment_cost_basis() -> dict[str, Any]:
 
 def update_payment_cost_basis(
     *,
+    proposal_id: int | None = None,
     sponsor_acquirer_fee_bps: int | float | None = None,
     gateway_per_txn_usd: float | None = None,
     annualized_pci_compliance_usd: float | None = None,
@@ -327,10 +359,63 @@ def update_payment_cost_basis(
     are preserved verbatim. Clears the lru_cache on success so the
     next read sees the new values.
 
+    ``proposal_id`` is supplied by proposal-scoped UI callers so an archived
+    proposal cannot mutate the shared pricing source through a stale tab.
+
     Returns the updated `our_cost_basis` section."""
-    project_root = Path(__file__).resolve().parents[2]
+    proposal_guard = (
+        proposal_write_lock(proposal_id)
+        if proposal_id is not None
+        else nullcontext()
+    )
+    with proposal_guard:
+        with payment_cost_basis_lock():
+            if proposal_id is not None:
+                # Keep the DB write fence and process lock held through the
+                # atomic file replacement. Archive cannot commit between this
+                # authorization check and the shared-data mutation.
+                with session_scope() as db:
+                    acquire_proposal_write_fence(db, proposal_id)
+                    ensure_proposal_mutable(
+                        db,
+                        proposal_id,
+                        operation="edit the shared payment cost basis",
+                    )
+                    return _update_payment_cost_basis_file(
+                        sponsor_acquirer_fee_bps=sponsor_acquirer_fee_bps,
+                        gateway_per_txn_usd=gateway_per_txn_usd,
+                        annualized_pci_compliance_usd=(
+                            annualized_pci_compliance_usd
+                        ),
+                        annualized_support_allocation_usd=(
+                            annualized_support_allocation_usd
+                        ),
+                        confirmed_by_ops_finance=confirmed_by_ops_finance,
+                    )
+            return _update_payment_cost_basis_file(
+                sponsor_acquirer_fee_bps=sponsor_acquirer_fee_bps,
+                gateway_per_txn_usd=gateway_per_txn_usd,
+                annualized_pci_compliance_usd=(
+                    annualized_pci_compliance_usd
+                ),
+                annualized_support_allocation_usd=(
+                    annualized_support_allocation_usd
+                ),
+                confirmed_by_ops_finance=confirmed_by_ops_finance,
+            )
+
+
+def _update_payment_cost_basis_file(
+    *,
+    sponsor_acquirer_fee_bps: int | float | None,
+    gateway_per_txn_usd: float | None,
+    annualized_pci_compliance_usd: float | None,
+    annualized_support_allocation_usd: float | None,
+    confirmed_by_ops_finance: bool | None,
+) -> dict[str, Any]:
+    """Replace the shared JSON while caller holds payment_cost_basis_lock."""
     rel_path = SERVICE_LINES[SERVICE_LINE_PAYMENT_SYSTEMS]["pricing_data_path"]
-    full = project_root / rel_path
+    full = _active_data_path(rel_path)
 
     raw = full.read_text(encoding="utf-8")
     data = json.loads(raw)
@@ -347,18 +432,39 @@ def update_payment_cost_basis(
     if confirmed_by_ops_finance is not None:
         section["_confirmed_by_ops_finance"] = bool(confirmed_by_ops_finance)
 
-    # Pretty-print at indent=2 to match the existing file shape;
-    # ensure_ascii=False keeps unicode characters readable in source
-    # control diffs.
-    full.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    # Write-then-replace keeps the shared pricing source parseable if the
+    # process crashes or the disk write fails halfway through.
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    fd, temp_name = tempfile.mkstemp(
+        dir=full.parent,
+        prefix=f".{full.name}.",
+        suffix=".tmp",
     )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, full)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     reload_payment_systems_data()
     return section
 
 
 def recompute_payment_profit_math(proposal_id: int) -> bool:
+    """Serialize a proposal refresh against the shared cost-basis file."""
+    with proposal_write_lock(proposal_id):
+        with payment_cost_basis_lock():
+            return _recompute_payment_profit_math_locked(proposal_id)
+
+
+def _recompute_payment_profit_math_locked(proposal_id: int) -> bool:
     """Re-compute and persist profit math for an existing payment-
     market scan, using the CURRENT `our_cost_basis` from JSON.
     Useful after the user edits cost-basis values via the dialog —
@@ -383,7 +489,10 @@ def recompute_payment_profit_math(proposal_id: int) -> bool:
     from app.jobs.payment_market_researcher import compute_profit_math
 
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        acquire_proposal_write_fence(db, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="recompute payment profit math",
+        )
         if p is None:
             return False
         raw = p.payment_market_scan_json
@@ -450,7 +559,14 @@ def recompute_payment_profit_math(proposal_id: int) -> bool:
     # Recompute against the CURRENT JSON cost basis (lru_cache was
     # cleared by the upstream update call, so this picks up the
     # new values).
-    rebuilt.profit_math = compute_profit_math(rebuilt)
+    from app.services.review_freshness import payment_cost_basis_provenance
+
+    pricing_snapshot = json.loads(json.dumps(load_payment_systems_pricing()))
+    used_provenance = payment_cost_basis_provenance(pricing_snapshot)
+    rebuilt.profit_math = compute_profit_math(
+        rebuilt,
+        pricing_data=pricing_snapshot,
+    )
 
     # Replace just the profit_math section in the persisted blob —
     # everything else stays as the agent originally produced it.
@@ -466,9 +582,25 @@ def recompute_payment_profit_math(proposal_id: int) -> bool:
         "cost_basis_assumptions": rebuilt.profit_math.cost_basis_assumptions,
         "computation_notes": rebuilt.profit_math.computation_notes,
     }
+    # Provenance makes the global cost-basis dependency explicit. A change to
+    # the shared file makes every other payment proposal fail readiness until
+    # its profit math is refreshed, without a fragile multi-row DB update.
+    from app.services.review_freshness import (
+        current_payment_cost_basis_provenance,
+        stamp_payment_market_scan_provenance,
+    )
+    if current_payment_cost_basis_provenance() != used_provenance:
+        return False
+    data = stamp_payment_market_scan_provenance(
+        data,
+        provenance=used_provenance,
+    )
 
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        acquire_proposal_write_fence(db, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="recompute payment profit math",
+        )
         if p is None:
             return False
         p.payment_market_scan_json = json.dumps(
@@ -497,6 +629,7 @@ __all__ = [
     "get_service_line_config",
     "load_payment_systems_pricing",
     "load_payment_systems_context",
+    "payment_cost_basis_lock",
     "reload_payment_systems_data",
     "get_payment_cost_basis",
     "update_payment_cost_basis",

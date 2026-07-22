@@ -225,6 +225,14 @@ class PricingPackageLine(Base, TimestampMixin):
         Numeric(10, 2),
         nullable=False,
     )
+    loaded_hourly_override_usd: Mapped[float | None] = mapped_column(
+        Numeric(10, 2),
+        nullable=True,
+    )
+    billed_hourly_override_usd: Mapped[float | None] = mapped_column(
+        Numeric(10, 2),
+        nullable=True,
+    )
 
     # Free-form rationale from the Cost Analyst (e.g., "Single PM
     # for 12-month PoP; mid-band hire fits a 3-yr-experience CO/CTR

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import re
-from statistics import mean
+from statistics import mean, median
 
 from app.agents.market_researcher import (
     ComparableAward,
@@ -81,6 +81,9 @@ _AWARD_BOILERPLATE = {
     "nbr",
     "number",
 }
+
+_MIN_VALUED_AWARDS_FOR_BAND = 2
+_MIN_RELEVANCE_FOR_BAND = 0.5
 
 
 def _canonicalize_award_title(title: str) -> str:
@@ -174,6 +177,106 @@ def _merge_band(
     )
 
 
+def _normalized_award_value(
+    award: ComparableAward, target_pop_months: int | None,
+) -> float | None:
+    """Normalize a comparable award value to the current proposal PoP.
+
+    The upstream agents sometimes return a market band anchored on the
+    heuristic query range. The consolidator treats award rows as the
+    evidentiary source instead: valued awards at reasonable relevance
+    get normalized to the target PoP, then min/median/max become the
+    persisted band.
+    """
+    if award.award_value_usd is None:
+        return None
+    try:
+        value = float(award.award_value_usd)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+
+    pop = award.period_of_performance_months
+    if target_pop_months and target_pop_months > 0 and pop:
+        try:
+            pop_float = float(pop)
+        except (TypeError, ValueError):
+            pop_float = 0.0
+        if pop_float > 0:
+            return value / pop_float * float(target_pop_months)
+    return value
+
+
+def _derive_band_from_awards(
+    awards: list[ComparableAward],
+    *,
+    target_pop_months: int | None,
+) -> tuple[tuple[float, float, float] | None, str, str | None]:
+    """Return ((low, mid, high), methodology_note, warning).
+
+    A band is defensible only when at least two comparable awards have
+    disclosed values and relevance >= _MIN_RELEVANCE_FOR_BAND. If not,
+    return no band and a sparse-data warning. This deliberately prevents
+    the old circular behavior where the model re-emitted the rough
+    internal estimate as market data.
+    """
+    normalized_values: list[float] = []
+    valued_but_low_relevance = 0
+    missing_value = 0
+
+    for aw in awards:
+        rel = (
+            float(aw.relevance_score)
+            if aw.relevance_score is not None else _MIN_RELEVANCE_FOR_BAND
+        )
+        if rel < _MIN_RELEVANCE_FOR_BAND:
+            if aw.award_value_usd is not None:
+                valued_but_low_relevance += 1
+            continue
+        value = _normalized_award_value(aw, target_pop_months)
+        if value is None:
+            missing_value += 1
+            continue
+        normalized_values.append(value)
+
+    if len(normalized_values) < _MIN_VALUED_AWARDS_FOR_BAND:
+        note = (
+            "Consolidator did not persist a market band because fewer "
+            f"than {_MIN_VALUED_AWARDS_FOR_BAND} valued comparable awards "
+            f"with relevance >= {_MIN_RELEVANCE_FOR_BAND:.2f} were found. "
+            "Provider-reported fallback bands are retained only in the "
+            "methodology text, not as official band values."
+        )
+        warning = (
+            f"Only {len(normalized_values)} valued comparable award(s) "
+            "met the evidence threshold for a defensible market band"
+        )
+        if missing_value:
+            warning += f"; {missing_value} otherwise-relevant award(s) lacked disclosed value"
+        if valued_but_low_relevance:
+            warning += f"; {valued_but_low_relevance} valued award(s) were too low-relevance"
+        return None, note, warning + "."
+
+    values = sorted(normalized_values)
+    band = (float(values[0]), float(median(values)), float(values[-1]))
+    pop_note = (
+        f" normalized to {target_pop_months} month(s)"
+        if target_pop_months else ""
+    )
+    note = (
+        "Consolidator recalculated the persisted market band from "
+        f"{len(values)} cited comparable award value(s){pop_note}. "
+        "Low/mid/high are min/median/max of the normalized values; "
+        "provider-reported bands are treated as narrative context only."
+    )
+    return band, note, None
+
+
+def _fmt_band_value(value: float | None) -> str:
+    return f"${float(value):,.0f}" if value is not None else "unknown"
+
+
 def _merge_methodology(a: MarketScanResult, b: MarketScanResult) -> str:
     """Compose a methodology string that captures both providers'
     reasoning. Pass A leads (Gemini has the longer track record on
@@ -213,6 +316,7 @@ def consolidate_market_research(
     proposal_id: int,
     pass_a: MarketScanResult,
     pass_b: MarketScanResult,
+    target_pop_months: int | None = None,
 ) -> MarketScanResult:
     """Merge two providers' MarketScanResult outputs into one. Returns
     a single MarketScanResult ready for `upsert_market_scan` —
@@ -333,9 +437,33 @@ def consolidate_market_research(
         )
 
     # ---- Band + methodology + insufficient warning ----
-    band_low, band_mid, band_high = _merge_band(pass_a, pass_b)
-    methodology = _merge_methodology(pass_a, pass_b)
+    provider_band_low, provider_band_mid, provider_band_high = _merge_band(
+        pass_a, pass_b,
+    )
+    derived_band, band_note, band_warning = _derive_band_from_awards(
+        merged_awards, target_pop_months=target_pop_months,
+    )
+    if derived_band is None:
+        band_low = band_mid = band_high = None
+    else:
+        band_low, band_mid, band_high = derived_band
+
+    methodology = "\n\n".join([
+        band_note,
+        _merge_methodology(pass_a, pass_b),
+        (
+            "Provider-reported band before evidence recalculation: "
+            f"low={_fmt_band_value(provider_band_low)} / "
+            f"mid={_fmt_band_value(provider_band_mid)} / "
+            f"high={_fmt_band_value(provider_band_high)}."
+        ),
+    ])
     insufficient = _merge_insufficient(pass_a, pass_b)
+    if band_warning:
+        insufficient = (
+            f"{insufficient} | {band_warning}"
+            if insufficient else band_warning
+        )
 
     log.info(
         "market_consolidator: proposal %d — "

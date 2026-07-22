@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from app.agents.compliance_matrix import (
@@ -38,6 +39,7 @@ from app.models import (
     ProposalSection,
     RfpPackageDocument,
 )
+from app.services.proposal_access import ensure_proposal_mutable
 from app.services.proposals import (
     UploadedFile,
     _content_hash,
@@ -45,11 +47,43 @@ from app.services.proposals import (
     _validate_upload_extensions,
     _validate_upload_sizes,
 )
+from app.services.storage_safety import UnsafeManagedPath, require_contained_file
 
 log = logging.getLogger(__name__)
 
 
 _REQ_ID_NUM_RE = re.compile(r"REQ-(\d+)")
+
+
+def _register_amendment_rollback_cleanup(
+    db: Session,
+    path: Path,
+    *,
+    package_id: int,
+) -> None:
+    state = {"committed": False}
+
+    def _after_commit(_session: Session) -> None:
+        state["committed"] = True
+
+    def _after_rollback(_session: Session) -> None:
+        if state["committed"]:
+            return
+        try:
+            safe_path = require_contained_file(
+                path,
+                root=RFP_PACKAGES_DIR,
+                expected_parent_name=str(package_id),
+                description="rolled-back amendment file",
+            )
+            safe_path.unlink(missing_ok=True)
+        except UnsafeManagedPath as exc:
+            log.error("refusing amendment rollback cleanup for %s: %s", path, exc)
+        except Exception:
+            log.exception("failed amendment rollback cleanup for %s", path)
+
+    event.listen(db, "after_commit", _after_commit, once=True)
+    event.listen(db, "after_rollback", _after_rollback, once=True)
 
 
 @dataclass
@@ -104,10 +138,15 @@ def attach_amendment_to_proposal(
     file_list = list(files)
     if not file_list:
         return []
-    _validate_upload_extensions(file_list)
+    try:
+        _validate_upload_extensions(file_list)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported amendment file type: {exc}") from exc
     _validate_upload_sizes(file_list)
 
-    proposal = db.get(Proposal, proposal_id)
+    proposal = ensure_proposal_mutable(
+        db, proposal_id, operation="attach amendment",
+    )
     if proposal is None:
         raise ValueError(f"proposal {proposal_id} not found")
     pkg_id = proposal.rfp_package_id
@@ -138,6 +177,7 @@ def attach_amendment_to_proposal(
 
         path = pkg_dir / safe
         path.write_bytes(f.content)
+        _register_amendment_rollback_cleanup(db, path, package_id=pkg_id)
 
         hash_hex = _content_hash(f.content)
         doc = RfpPackageDocument(
@@ -172,8 +212,7 @@ def list_amendments(proposal_id: int, db: Session) -> list[dict]:
         db.query(RfpPackageDocument)
         .filter(
             RfpPackageDocument.rfp_package_id == pkg_id,
-            RfpPackageDocument.document_role.is_not(None),
-            RfpPackageDocument.document_role != "original",
+            RfpPackageDocument.document_role.in_({"amendment", "qa_response"}),
         )
         .all()
     )
@@ -276,6 +315,9 @@ def apply_amendment_delta(
     """
     # Look up the amendment doc's filename — used as the amendment_origin
     # marker on every row we touch / insert.
+    ensure_proposal_mutable(
+        db, proposal_id, operation="apply amendment",
+    )
     amendment_doc = db.get(RfpPackageDocument, amendment_document_id)
     amendment_filename = amendment_doc.filename if amendment_doc is not None else "(unknown)"
 
@@ -359,6 +401,11 @@ def apply_amendment_delta(
             category=existing.category,
             weight=existing.weight,
             compliance_status=ComplianceStatus.TO_BE_DRAFTED,
+            # The requirement keeps the same logical REQ-ID and the existing
+            # section is explicitly marked stale below. Preserve that canonical
+            # relationship so the active replacement does not appear
+            # unassigned while the user revises the linked draft.
+            linked_response_section_id=existing.linked_response_section_id,
             amendment_origin=amendment_filename,
             status="active",
         )

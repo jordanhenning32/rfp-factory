@@ -31,6 +31,7 @@ Inputs the agent gets:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -390,7 +391,8 @@ LIFECYCLE PHASES — REQUIRED:
 - Phases CAN overlap — Operations and Build often run in parallel toward end of PoP. Use start_month + duration_months to express overlap.
 - For each phase, allocate hours from your labor_lines[] entries. The sum of allocated hours per labor_category across ALL phases should equal that category's labor_lines.hours value (a small under-allocation is OK and reads as "general support time"; over-allocation is rejected).
 - Allocations are integers OR floats. Use realistic distributions — Discovery is typically 60-70% BA / PM, Build is 70%+ engineers, Operations is light steady-state.
-- Phases drive the Basis of Estimate in the Cost Volume narrative. Realistic phase mass + duration is what evaluators score for cost realism."""
+- Phases drive the Basis of Estimate in the Cost Volume narrative. Realistic phase mass + duration is what evaluators score for cost realism.
+- When buyer cost-matrix rows are shown, treat their exact labels as required reporting context. If a row genuinely represents a lifecycle/work phase, use that buyer-authored label as the phase name so deterministic pricing can map cleanly. Do NOT force unlike rows (unit rates, option years, fees, quantities, totals, or metadata) into phases, and never invent allocations or dollar totals merely to fill a matrix."""
 
 
 # ---- User template --------------------------------------------------------
@@ -409,6 +411,9 @@ Estimated value range (rough, from intake): ${est_value_low_usd:,.0f} - ${est_va
 
 === Outline / section briefs ===
 {outline_briefs}
+
+=== Buyer cost-matrix reporting rows (template-specific; may be empty) ===
+{cost_matrix_requirements_block}
 
 === Market scan (Agent 1's output) ===
 Market band: ${market_band_low} / ${market_band_mid} / ${market_band_high} (low / mid / high)
@@ -458,6 +463,7 @@ def analyze_costs(
     market_scan_snapshot: dict[str, Any] | None,
     quadratic_summary: str,
     team_roster_block: str = "",
+    cost_matrix_requirements: list[dict[str, Any]] | None = None,
 ) -> CostAnalystOutput:
     """Run the Cost Analyst LLM call. Returns a structured output the
     orchestrator hands to compute_scenario_packages.
@@ -494,6 +500,11 @@ def analyze_costs(
         est_value_high_usd=est_value_high_usd,
         scope_summary=scope_summary or "(no scope summary)",
         outline_briefs=outline_briefs or "(no outline available)",
+        cost_matrix_requirements_block=(
+            json.dumps(cost_matrix_requirements, indent=2, ensure_ascii=False)
+            if cost_matrix_requirements
+            else "(no cost matrix supplied)"
+        ),
         market_band_low=_fmt_band(
             market_scan_snapshot,
             "market_band_low_usd",

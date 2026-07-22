@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 from nicegui import ui
 
+from app.config import get_settings
 from app.core.company_profile import get_profile_version
 from app.ui._theme import (
     CYAN,
@@ -27,6 +28,13 @@ NAV_ITEMS = [
     ("Config", "/config", "tune"),
     ("Admin", "/admin", "monitor_heart"),
 ]
+
+
+def _visible_nav_items() -> list[tuple[str, str, str]]:
+    """Hide data-management surfaces in the optional demo workspace."""
+    if not get_settings().is_demo:
+        return NAV_ITEMS
+    return [item for item in NAV_ITEMS if item[1] not in {"/kb", "/config"}]
 
 
 def _nav_item(label: str, target: str, icon: str) -> None:
@@ -82,13 +90,22 @@ def page_frame(title: str):
 
         # Right cluster: tagline + profile-version badge.
         with ui.column().classes("gap-0 items-end"):
-            ui.label(TAGLINE).classes("text-xs italic").style(f"color: {CYAN};")
-            ui.label(f"Quadratic Digital · profile v{get_profile_version()}").classes("text-[10px]").style(
+            ui.label(TAGLINE).classes("text-xs italic").style(
+                f"color: {CYAN};"
+            )
+            workspace_label = (
+                "CURATED DEMO WORKSPACE"
+                if get_settings().is_demo
+                else f"Quadratic Digital · profile v{get_profile_version()}"
+            )
+            ui.label(workspace_label).classes("text-[10px]").style(
                 f"color: {TEXT_ON_DARK}; opacity: 0.7;"
             )
 
-    with ui.left_drawer(value=True, fixed=True).classes("bg-slate-50 p-2 border-r border-slate-200"):
-        for label, target, icon in NAV_ITEMS:
+    with ui.left_drawer(value=True, fixed=True).classes(
+        "bg-slate-50 p-2 border-r border-slate-200"
+    ):
+        for label, target, icon in _visible_nav_items():
             _nav_item(label, target, icon)
 
     with ui.column().classes("w-full p-6 gap-4"):

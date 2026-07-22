@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 from anthropic import Anthropic
@@ -37,12 +38,38 @@ _T = TypeVar("_T")
 _TRANSIENT_BACKOFF = (2.0, 4.0, 8.0)  # delays in seconds, max 3 retries
 
 
+def _is_anthropic_overload_error(exc: BaseException) -> bool:
+    """Return whether *exc* carries Anthropic's explicit overload signal.
+
+    Anthropic currently surfaces overloads as ``APIStatusError`` with HTTP
+    529 and an ``overloaded_error`` body.  Some SDK/transport paths retain
+    only the short ``Overloaded`` message, so accept that exact message for
+    the same exception class as a narrow fallback.  Deliberately avoid a
+    broad ``"overload" in message`` check: application errors can contain
+    that word without being safe to retry.
+    """
+    if type(exc).__name__ != "APIStatusError":
+        return False
+
+    if getattr(exc, "status_code", None) == 529:
+        return True
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        if isinstance(error, dict) and error.get("type") == "overloaded_error":
+            return True
+
+    return str(exc).strip().lower() == "overloaded"
+
+
 def _is_transient_error(exc: BaseException) -> bool:
     """Detect a transient / retryable error across providers.
 
     Covers two classes of failure:
       1. Rate limits / quota exhaustion (429 family).
-      2. Transient server unavailability (502 / 503 / 504).
+      2. Transient server unavailability (502 / 503 / 504), including
+         Anthropic's explicit 529 ``overloaded_error`` response.
 
     We do this by class name + error-message inspection rather than
     importing each SDK's typed exception, so the helper still works if
@@ -57,28 +84,56 @@ def _is_transient_error(exc: BaseException) -> bool:
     # surface APIStatusError which carries the status code in the message.
     if cls_name in ("ServiceUnavailable", "BadGateway", "GatewayTimeout"):
         return True
+    if _is_anthropic_overload_error(exc):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if (
+        not isinstance(status_code, bool)
+        and isinstance(status_code, int)
+        and status_code in {429, 502, 503, 504}
+    ):
+        return True
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if (
+        not isinstance(response_status, bool)
+        and isinstance(response_status, int)
+        and response_status in {429, 502, 503, 504}
+    ):
+        return True
     msg = str(exc).lower()
+    contextual_http_status = re.search(
+        r"\b(?:http(?:\s+status)?|status(?:\s+code)?|error(?:\s+code)?|response)"
+        r"\s*[:=]?\s*(?:429|502|503|504)\b",
+        msg,
+    ) is not None
     return (
         # Rate-limit signals
-        "429" in msg
+        contextual_http_status
         or "rate limit" in msg
         or "rate-limit" in msg
         or "rate_limit" in msg
         or "quota" in msg
         or "too many requests" in msg
         # Transient server signals
-        or "503" in msg
-        or "502" in msg
-        or "504" in msg
         or "service unavailable" in msg
         or "bad gateway" in msg
         or "gateway timeout" in msg
     )
 
 
-def _retry_on_transient_error(fn: Callable[[], _T], *, agent_name: str, model: str) -> _T:
+def is_transient_provider_error(exc: BaseException) -> bool:
+    """Public shared classifier for callers deciding retry/fallback strategy."""
+
+    return _is_transient_error(exc)
+
+
+def _retry_on_transient_error(
+    fn: Callable[[], _T], *, agent_name: str, model: str
+) -> _T:
     """Call `fn()`; if it raises a transient error (rate limit OR
-    502/503/504), sleep and retry up to len(_TRANSIENT_BACKOFF) times
+    502/503/504/provider overload), sleep and retry up to
+    len(_TRANSIENT_BACKOFF) times
     with exponential backoff. Any non-transient error is re-raised
     immediately so the caller's normal error handling (failure
     recording, temperature-fallback, etc.) runs.
@@ -309,14 +364,18 @@ class AnthropicSync:
 
         usage_dict contains: input_tokens, output_tokens, cost_usd.
         """
-        started = datetime.utcnow()
+        started = datetime.now(UTC)
         try:
-            resp = self._client.messages.create(
+            resp = _retry_on_transient_error(
+                lambda: self._client.messages.create(
+                    model=model,
+                    system=system or "",
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ),
+                agent_name=agent_name,
                 model=model,
-                system=system or "",
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
             )
         except Exception as exc:
             _record_run(
@@ -327,7 +386,7 @@ class AnthropicSync:
                 output_tokens=0,
                 cost_usd=0.0,
                 started_at=started,
-                completed_at=datetime.utcnow(),
+                completed_at=datetime.now(UTC),
                 status=AgentRunStatus.FAILED,
                 error_text=str(exc),
             )
@@ -348,7 +407,7 @@ class AnthropicSync:
             output_tokens=out_tok,
             cost_usd=cost,
             started_at=started,
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(UTC),
             status=AgentRunStatus.COMPLETED,
         )
         return text, {"input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost}
@@ -588,7 +647,7 @@ class AnthropicSync:
             }
         ]
 
-        try:
+        def _run_stream():
             with self._client.messages.stream(
                 model=model,
                 system=system or "",
@@ -599,7 +658,14 @@ class AnthropicSync:
             ) as st:
                 for _ in st:
                     pass
-                resp = st.get_final_message()
+                return st.get_final_message()
+
+        try:
+            resp = _retry_on_transient_error(
+                _run_stream,
+                agent_name=agent_name,
+                model=model,
+            )
         except Exception as exc:
             _record_run(
                 proposal_id=proposal_id,
@@ -705,6 +771,39 @@ def get_anthropic() -> AnthropicSync:
 
 # ---- Gemini (Reviewer B + Cost Reviewer) -----------------------------------
 
+def _adapt_json_schema_for_gemini(value: Any) -> Any:
+    """Copy a JSON Schema while removing Gemini-unsupported keywords.
+
+    The google-genai SDK's ``Schema`` model accepts ``additionalProperties``,
+    but the Generative Language backend currently rejects the serialized
+    ``additional_properties`` field.  Tool schemas can contain that keyword
+    at any depth (Section M's requirement-to-factor map is one example), so
+    adapt recursively at the Gemini boundary.  The SDK's OpenAPI ``Schema``
+    type also represents a nullable value as ``type`` + ``nullable`` rather
+    than JSON Schema's ``type: [T, "null"]``; normalize that equivalent form
+    while walking the tree.  Copy-on-write is important: Anthropic and OpenAI
+    continue to receive the original, stronger schema.
+    """
+    if isinstance(value, dict):
+        adapted = {
+            key: _adapt_json_schema_for_gemini(child)
+            for key, child in value.items()
+            if key != "additionalProperties"
+        }
+        schema_types = adapted.get("type")
+        if (
+            isinstance(schema_types, list)
+            and len(schema_types) == 2
+            and "null" in schema_types
+        ):
+            non_null_types = [item for item in schema_types if item != "null"]
+            if len(non_null_types) == 1:
+                adapted["type"] = non_null_types[0]
+                adapted["nullable"] = True
+        return adapted
+    if isinstance(value, list):
+        return [_adapt_json_schema_for_gemini(child) for child in value]
+    return value
 
 class GeminiSync:
     """Thin sync wrapper around Google's google-genai SDK with a `call_tool`
@@ -761,7 +860,7 @@ class GeminiSync:
         Returns (tool_input_dict, usage_dict) with the same shape as
         AnthropicSync.call_tool.
         """
-        started = datetime.utcnow()
+        started = datetime.now(UTC)
 
         # Build the system instruction (system + optional cached prefix).
         sys_text = system or ""
@@ -794,15 +893,13 @@ class GeminiSync:
         # Build the tool spec. Gemini's function_declarations expects the
         # JSON schema in the `parameters` field — same shape as Anthropic's
         # input_schema.
-        tool_decl = self._types.Tool(
-            function_declarations=[
-                self._types.FunctionDeclaration(
-                    name=tool["name"],
-                    description=tool.get("description", ""),
-                    parameters=tool["input_schema"],
-                )
-            ]
-        )
+        tool_decl = self._types.Tool(function_declarations=[
+            self._types.FunctionDeclaration(
+                name=tool["name"],
+                description=tool.get("description", ""),
+                parameters=_adapt_json_schema_for_gemini(tool["input_schema"]),
+            )
+        ])
 
         # Disable Gemini's content moderation. Proposal text is policy /
         # corporate / technical content — there's no scenario where Gemini's
@@ -869,7 +966,7 @@ class GeminiSync:
                 output_tokens=0,
                 cost_usd=0.0,
                 started_at=started,
-                completed_at=datetime.utcnow(),
+                completed_at=datetime.now(UTC),
                 status=AgentRunStatus.FAILED,
                 error_text=str(exc),
             )
@@ -908,9 +1005,14 @@ class GeminiSync:
         cost = estimate_gemini_cost(model, in_tok, out_tok)
 
         if tool_input is None:
-            err = (
-                "Gemini did not return a function_call "
-                f"(model={model}, in={in_tok}, out={out_tok}, candidates={len(candidates)})."
+            # A forced-tool request without a function call is not a clean,
+            # empty domain result. It means the provider stripped or failed
+            # the structured response. Treating it as ``{}`` can turn a
+            # broken reviewer/extractor into a false "zero findings" success.
+            error = RuntimeError(
+                f"Gemini returned no required function_call {tool['name']!r} "
+                f"(model={model}, input_tokens={in_tok}, "
+                f"output_tokens={out_tok}, candidates={len(candidates)})"
             )
             _record_run(
                 proposal_id=proposal_id,
@@ -920,33 +1022,11 @@ class GeminiSync:
                 output_tokens=out_tok,
                 cost_usd=cost,
                 started_at=started,
-                completed_at=datetime.utcnow(),
+                completed_at=datetime.now(UTC),
                 status=AgentRunStatus.FAILED,
-                error_text=err,
+                error_text=str(error),
             )
-            raise RuntimeError(err)
-
-        if False and tool_input is None:
-            # Gemini Flash sometimes returns 200 OK with 0 output tokens
-            # and no function_call — usually safety-filter strip OR just
-            # model flakiness on forced tool calls. Treat as a graceful
-            # "no data" response (empty dict) so callers using
-            # `tool_input.get('findings', [])` see 0 findings and the
-            # loop continues. Logged as WARNING (not error) and recorded
-            # as COMPLETED in agent_runs since the API call succeeded —
-            # we did pay for the input tokens.
-            log.warning(
-                "%s: Gemini returned no function_call (model=%s, "
-                "in=%d, out=%d, candidates=%d) — treating as empty result. "
-                "If this happens consistently, switch MODEL_REVIEWER_B to "
-                "gemini-2.5-pro for stronger judgment.",
-                agent_name,
-                model,
-                in_tok,
-                out_tok,
-                len(candidates),
-            )
-            tool_input = {}
+            raise error
 
         _record_run(
             proposal_id=proposal_id,
@@ -956,7 +1036,7 @@ class GeminiSync:
             output_tokens=out_tok,
             cost_usd=cost,
             started_at=started,
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(UTC),
             status=AgentRunStatus.COMPLETED,
         )
         return tool_input, {

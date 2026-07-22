@@ -134,8 +134,8 @@ def _render_cost_tab(proposal_id: int) -> None:
       4. Cost-deferred section drafts (status + preview)
 
     payment_systems:
-      1. Pipeline status (Cost Analyst + Cost Reviewer chips greyed
-         since they don't run for this service line)
+      1. Pipeline status for Payment Market Research, Cost Volume Writer,
+         and the payment-specific Cost Reviewer
       2. Info banner + action buttons (Run Payment Market Research,
          Run Cost Writer, Edit Cost Basis) — labor controls hidden
       3. Payment Market Scan card (pricing recommendation with
@@ -188,6 +188,15 @@ def _render_cost_tab(proposal_id: int) -> None:
             has_drafts=has_drafts,
             has_review=has_review,
             n_cost_sections=len(cost_sections),
+            on_refresh=render.refresh,
+        )
+
+        # Buyer-authored cost workbooks are detected at intake but remain
+        # pending until reviewed pricing exists. Keep this panel above every
+        # service-line empty state so users can also attach a matrix later.
+        from app.ui.tabs.cost_matrix import render_cost_matrix_panel
+        render_cost_matrix_panel(
+            proposal_id,
             on_refresh=render.refresh,
         )
 
@@ -333,10 +342,12 @@ def _render_cost_pipeline_status(
 ) -> None:
     """Sticky-feeling status header. Pipeline-stage chips + action
     buttons that adapt to what's been run. Branches by service_line:
-    payment_systems shows a 2-stage pipeline (Payment Market Research
-    + Cost Volume Writer) since Cost Analyst / Cost Reviewer don't
-    apply when there's no labor build."""
-    is_payment_systems = get_service_line(proposal_id) == SERVICE_LINE_PAYMENT_SYSTEMS
+    payment_systems shows a 3-stage pipeline (Payment Market Research,
+    Cost Volume Writer, and the payment-specific Cost Reviewer). Only the
+    labor-based Cost Analyst is omitted because there is no labor build."""
+    is_payment_systems = (
+        get_service_line(proposal_id) == SERVICE_LINE_PAYMENT_SYSTEMS
+    )
     if is_payment_systems:
         # has_scan + has_payment_review for payment_systems both come
         # from columns on the proposal — the labor-flow MarketScan +
@@ -424,9 +435,9 @@ def _render_cost_pipeline_status(
 
         # Action buttons row — buttons appear/relabel based on state
         # so the user always sees the "what's next" action surfaced.
-        # Service-line branch: payment_systems skips Cost Analyst +
-        # Cost Reviewer entirely (no labor build to make; Cost Writer
-        # renders the fee schedule directly from
+        # Service-line branch: payment_systems skips the labor-based Cost
+        # Analyst (no labor build to make); Cost Writer renders the fee
+        # schedule directly from
         # data/pricing/payment_systems.json).
         if is_payment_systems:
             # has_payment_scan was computed at the top of this function

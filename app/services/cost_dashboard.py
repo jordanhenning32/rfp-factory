@@ -24,6 +24,11 @@ _AGENT_TO_STAGE: dict[str, str] = {
     "intake_metadata": "Intake metadata",
     "compliance_matrix": "Compliance Matrix",
     "compliance_validator": "Compliance Matrix",
+    "compliance_validator_retry": "Compliance Matrix",
+    "compliance_validator_fallback": "Compliance Matrix",
+    "compliance_completeness": "Compliance Matrix",
+    "compliance_completeness_retry": "Compliance Matrix",
+    "compliance_completeness_fallback": "Compliance Matrix",
     "shortfall_strategist": "Shortfall Strategist",
     "teaming_researcher_research": "Teaming Researcher",
     "teaming_researcher_structure": "Teaming Researcher",
@@ -108,8 +113,8 @@ class ProposalCostSummary:
 
 def compute_proposal_costs(proposal_id: int) -> ProposalCostSummary:
     """Pull every AgentRun for `proposal_id` and aggregate by agent and
-    by logical stage. Excludes `_stage` rows — those are pipeline
-    progress markers, not LLM calls, and have cost_usd=0 by convention.
+    by logical stage. Excludes `_stage` and `_review_coverage` rows — those
+    are pipeline/audit markers, not LLM calls, and cost $0 by convention.
     """
     summary = ProposalCostSummary(proposal_id=proposal_id)
 
@@ -127,7 +132,7 @@ def compute_proposal_costs(proposal_id: int) -> ProposalCostSummary:
                 func.max(AgentRun.created_at).label("last_at"),
             )
             .where(AgentRun.proposal_id == proposal_id)
-            .where(AgentRun.agent_name != "_stage")
+            .where(AgentRun.agent_name.notin_(["_stage", "_review_coverage"]))
             .group_by(AgentRun.agent_name)
         ).all()
 

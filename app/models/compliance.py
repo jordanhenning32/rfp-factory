@@ -29,6 +29,15 @@ class ComplianceMatrixItem(Base, TimestampMixin):
     requirement_id: Mapped[str] = mapped_column(String(64), nullable=False)
     requirement_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_doc: Mapped[str] = mapped_column(String(500), nullable=False)
+    # Stable provenance for source-aware review. ``source_doc`` remains the
+    # human-readable filename, while this FK distinguishes documents that
+    # happen to share a filename and lets review state key to the canonical
+    # package row. Nullable for pre-migration/amendment history.
+    source_document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("rfp_package_documents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     source_section: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_page: Mapped[int | None] = mapped_column(nullable=True)
 

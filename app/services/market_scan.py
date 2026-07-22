@@ -21,6 +21,7 @@ from app.models import (
     MarketScanComparableAward,
     MarketScanCompetitor,
 )
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ def upsert_market_scan(
     we don't need to preserve row IDs.
     """
     with session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="replace market research",
+        )
         existing = db.execute(
             select(MarketScan).where(MarketScan.proposal_id == proposal_id)
         ).scalar_one_or_none()

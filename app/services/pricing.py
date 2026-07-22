@@ -33,7 +33,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.config import PROJECT_ROOT
+from app.config import DATA_DIR
 from app.core.enums import (
     BidRecommendation,
     MarketPosition,
@@ -45,11 +45,13 @@ from app.models import (
     PricingPackageLine,
     Proposal,
 )
+from app.services.proposal_access import ensure_proposal_mutable
+from app.services.review_freshness import invalidate_cost_review
 
 log = logging.getLogger(__name__)
 
 
-_PRICING_RULES_PATH = PROJECT_ROOT / "data" / "internal_pricing_rules.json"
+_PRICING_RULES_PATH = DATA_DIR / "internal_pricing_rules.json"
 
 
 # ---- Pricing rules loader -------------------------------------------------
@@ -296,6 +298,8 @@ class ComputedLine:
     billed_total_usd: float
     profit_per_hour_usd: float
     rationale: str
+    loaded_hourly_override_usd: float | None = None
+    billed_hourly_override_usd: float | None = None
     # Set when proposed_billing_rate exceeds the GSA OLM ceiling for
     # this category. Empty string when in-bounds.
     ceiling_violation_note: str = ""
@@ -536,6 +540,16 @@ def _compute_one_scenario_package(
                 billed_total_usd=_round_money(billed_total),
                 profit_per_hour_usd=_round_money(profit_per_hour),
                 rationale=ll.rationale,
+                loaded_hourly_override_usd=(
+                    _round_money(float(ll.loaded_hourly_override_usd))
+                    if ll.loaded_hourly_override_usd is not None
+                    else None
+                ),
+                billed_hourly_override_usd=(
+                    _round_money(float(ll.billed_hourly_override_usd))
+                    if ll.billed_hourly_override_usd is not None
+                    else None
+                ),
                 ceiling_violation_note=ceiling_note,
             )
         )
@@ -931,11 +945,19 @@ def upsert_pricing_packages(
     new H/M/L set. Cascade on the lines table clears old detail rows.
     Returns list of PricingPackage.id values in scenario order."""
     with session_scope() as db:
-        existing_rows = (
-            db.execute(select(PricingPackage).where(PricingPackage.proposal_id == proposal_id))
-            .scalars()
-            .all()
+        ensure_proposal_mutable(
+            db, proposal_id, operation="replace proposal pricing",
         )
+        existing_rows = db.execute(
+            select(PricingPackage)
+            .where(PricingPackage.proposal_id == proposal_id)
+        ).scalars().all()
+        if existing_rows:
+            invalidate_cost_review(
+                db,
+                proposal_id,
+                reason="Pricing packages were replaced; rerun Cost Reviewer.",
+            )
         for ex in existing_rows:
             db.delete(ex)
         if existing_rows:
@@ -979,6 +1001,8 @@ def upsert_pricing_packages(
                         proposed_billing_rate_usd=line.proposed_billing_rate_usd,
                         billed_total_usd=line.billed_total_usd,
                         profit_per_hour_usd=line.profit_per_hour_usd,
+                        loaded_hourly_override_usd=line.loaded_hourly_override_usd,
+                        billed_hourly_override_usd=line.billed_hourly_override_usd,
                         rationale=_compose_line_rationale(line),
                     )
                 )
@@ -1054,6 +1078,16 @@ def reconstruct_cost_analyst_output(
                     wage_band=str(ln["wage_band"]),
                     hours=float(ln["hours"]),
                     rationale=str(ln.get("rationale") or ""),
+                    loaded_hourly_override_usd=(
+                        float(ln["loaded_hourly_override_usd"])
+                        if ln.get("loaded_hourly_override_usd") is not None
+                        else None
+                    ),
+                    billed_hourly_override_usd=(
+                        float(ln["billed_hourly_override_usd"])
+                        if ln.get("billed_hourly_override_usd") is not None
+                        else None
+                    ),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -1137,6 +1171,74 @@ def reconstruct_cost_analyst_output(
     )
 
 
+def apply_cost_build_edits_to_output(
+    output: CostAnalystOutput,
+    *,
+    labor_edits: dict[str, dict[str, Any]] | None = None,
+    odc_edits: list[dict[str, Any]] | None = None,
+) -> CostAnalystOutput:
+    """Return a copy of a cost build with user-entered labor/ODC edits.
+
+    Labor edits are keyed by zero-based line index so duplicate labor
+    categories remain independently editable. Category keys are retained as a
+    compatibility fallback for older saved UI state.
+    """
+    labor_edits = labor_edits or {}
+    new_lines: list[CostAnalystLaborLine] = []
+    for index, line in enumerate(output.labor_lines):
+        edit = labor_edits.get(str(index)) or labor_edits.get(line.labor_category) or {}
+        new_lines.append(
+            CostAnalystLaborLine(
+                labor_category=line.labor_category,
+                wage_band=str(edit.get("wage_band") or line.wage_band),
+                hours=float(edit["hours"] if edit.get("hours") is not None else line.hours),
+                rationale=line.rationale,
+                loaded_hourly_override_usd=(
+                    edit.get("loaded_override")
+                    if "loaded_override" in edit
+                    else line.loaded_hourly_override_usd
+                ),
+                billed_hourly_override_usd=(
+                    edit.get("billed_override")
+                    if "billed_override" in edit
+                    else line.billed_hourly_override_usd
+                ),
+            )
+        )
+
+    if odc_edits is None:
+        new_odcs = list(output.odcs)
+    else:
+        new_odcs: list[CostAnalystOdc] = []
+        for edit in odc_edits:
+            try:
+                year_count = int(edit.get("year_count") or 1)
+            except (TypeError, ValueError):
+                year_count = 1
+            try:
+                amount = float(edit.get("amount_usd") or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            new_odcs.append(
+                CostAnalystOdc(
+                    item=str(edit.get("item") or ""),
+                    amount_usd=max(0.0, amount),
+                    justification=str(edit.get("justification") or ""),
+                    year_count=max(1, year_count),
+                )
+            )
+
+    return CostAnalystOutput(
+        labor_lines=new_lines,
+        avg_headcount_during_pop=output.avg_headcount_during_pop,
+        odcs=new_odcs,
+        subcontractor_costs_usd=output.subcontractor_costs_usd,
+        key_risks=output.key_risks,
+        executive_summary=output.executive_summary,
+        lifecycle_phases=output.lifecycle_phases,
+    )
+
+
 _VALID_PROPOSED_SCENARIOS = ("LOW", "MEDIUM", "HIGH")
 
 
@@ -1169,9 +1271,21 @@ def set_proposed_scenario(proposal_id: int, scenario: str) -> str:
             f"invalid proposed scenario {scenario!r}; expected one of {_VALID_PROPOSED_SCENARIOS}"
         )
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="select pricing scenario",
+        )
         if p is None:
             raise ValueError(f"proposal {proposal_id} not found")
+        previous = (p.proposed_scenario or "MEDIUM").upper().strip()
+        if previous != target:
+            invalidate_cost_review(
+                db,
+                proposal_id,
+                reason=(
+                    f"Selected pricing scenario changed from {previous} "
+                    f"to {target}; rerun Cost Reviewer."
+                ),
+            )
         p.proposed_scenario = target
     return target
 
@@ -1741,6 +1855,16 @@ def get_pricing_packages_snapshot(proposal_id: int) -> list[dict[str, Any]]:
                         "proposed_billing_rate_usd": float(ln.proposed_billing_rate_usd),
                         "billed_total_usd": float(ln.billed_total_usd),
                         "profit_per_hour_usd": float(ln.profit_per_hour_usd),
+                        "loaded_hourly_override_usd": (
+                            float(ln.loaded_hourly_override_usd)
+                            if ln.loaded_hourly_override_usd is not None
+                            else None
+                        ),
+                        "billed_hourly_override_usd": (
+                            float(ln.billed_hourly_override_usd)
+                            if ln.billed_hourly_override_usd is not None
+                            else None
+                        ),
                         "rationale": ln.rationale,
                     }
                     for ln in p.lines
@@ -1758,6 +1882,7 @@ __all__ = [
     "CostAnalystPhaseAllocation",
     "ComputedLine",
     "ComputedScenarioPackage",
+    "apply_cost_build_edits_to_output",
     "compute_custom_scenario_package",
     "compute_scenario_packages",
     "get_pricing_packages_snapshot",

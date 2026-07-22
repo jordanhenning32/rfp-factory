@@ -31,6 +31,7 @@ data/rfp_packages/*
 data/outputs/*
 data/backups/*
 data/debug/*
+data/demo/
 !data/kb_documents/.gitkeep
 !data/rfp_packages/.gitkeep
 !data/outputs/.gitkeep

@@ -2,9 +2,33 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
+
+
+@pytest.fixture(autouse=True)
+def sample_company_profile_when_unconfigured(monkeypatch):
+    """Use the tracked fictional profile when private runtime data is absent.
+
+    The public repository intentionally excludes ``company_profile.json``.
+    Unit tests must therefore be portable to a clean clone and must never
+    depend on a developer's untracked company data.
+    """
+    from app.core import company_profile
+
+    company_profile.get_company_profile.cache_clear()
+    if not company_profile.COMPANY_PROFILE_PATH.exists():
+        sample_path = (
+            Path(__file__).resolve().parents[1]
+            / "data"
+            / "company_profile.example.json"
+        )
+        monkeypatch.setattr(company_profile, "COMPANY_PROFILE_PATH", sample_path)
+    yield
+    company_profile.get_company_profile.cache_clear()
 
 
 @pytest.fixture()

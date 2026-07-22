@@ -59,25 +59,26 @@ def test_apply_amendment_delta_mutates_rows_and_flags_sections(inmemory_db):
         proposal_id = proposal.id
 
         # 3 active compliance items: REQ-001, REQ-002, REQ-003
+        seeded_items = {}
         for rid, txt in [
             ("REQ-001", "Submit a 25-page technical narrative."),
             ("REQ-002", "Submit a separate cost narrative."),
             ("REQ-003", "Provide three past-performance references."),
         ]:
-            db.add(
-                ComplianceMatrixItem(
-                    proposal_id=proposal_id,
-                    requirement_id=rid,
-                    requirement_text=txt,
-                    source_doc="original_rfp.pdf",
-                    source_section="Section 3",
-                    source_page=5,
-                    requirement_type=RequirementType.SHALL,
-                    category=RequirementCategory.TECHNICAL,
-                    compliance_status=ComplianceStatus.TO_BE_DRAFTED,
-                    status="active",
-                )
+            item = ComplianceMatrixItem(
+                proposal_id=proposal_id,
+                requirement_id=rid,
+                requirement_text=txt,
+                source_doc="original_rfp.pdf",
+                source_section="Section 3",
+                source_page=5,
+                requirement_type=RequirementType.SHALL,
+                category=RequirementCategory.TECHNICAL,
+                compliance_status=ComplianceStatus.TO_BE_DRAFTED,
+                status="active",
             )
+            db.add(item)
+            seeded_items[rid] = item
 
         # 1 amendment document
         doc = RfpPackageDocument(
@@ -92,23 +93,25 @@ def test_apply_amendment_delta_mutates_rows_and_flags_sections(inmemory_db):
         doc_id = doc.id
 
         # S1 addresses REQ-001 (will be modified) — should be marked stale
-        db.add(
-            ProposalSection(
-                proposal_id=proposal_id,
-                section_id="S1",
-                section_title="Technical Approach",
-                compliance_items_addressed_json=["REQ-001"],
-            )
+        section_1 = ProposalSection(
+            proposal_id=proposal_id,
+            section_id="S1",
+            section_title="Technical Approach",
+            compliance_items_addressed_json=["REQ-001"],
         )
+        db.add(section_1)
         # S2 addresses REQ-003 (will NOT change) — should stay clean
-        db.add(
-            ProposalSection(
-                proposal_id=proposal_id,
-                section_id="S2",
-                section_title="Management Approach",
-                compliance_items_addressed_json=["REQ-003"],
-            )
+        section_2 = ProposalSection(
+            proposal_id=proposal_id,
+            section_id="S2",
+            section_title="Management Approach",
+            compliance_items_addressed_json=["REQ-003"],
         )
+        db.add(section_2)
+        db.flush()
+        section_1_id = section_1.id
+        seeded_items["REQ-001"].linked_response_section_id = section_1_id
+        seeded_items["REQ-003"].linked_response_section_id = section_2.id
 
     # ── build a synthetic delta and apply it ─────────────────────────
     delta = ComplianceExtractionResult(
@@ -186,6 +189,7 @@ def test_apply_amendment_delta_mutates_rows_and_flags_sections(inmemory_db):
         req001_new = next(i for i in req001_rows if i.status == "active")
         assert "30-page" in req001_new.requirement_text
         assert req001_new.amendment_origin == "Amendment_0001.pdf"
+        assert req001_new.linked_response_section_id == section_1_id
         # Sanity: the superseded row points forward to the new row
         assert req001_old.superseded_by_id == req001_new.id
 

@@ -27,18 +27,15 @@ from app.models import (
     RfpPackageDocument,
 )
 from app.services.kb_context import build_shortfall_kb_context
+from app.services.proposal_access import require_proposal_mutable
 from app.services.sections import replace_outline
+from app.services.stages import record_stage as _set_stage
 
 log = logging.getLogger(__name__)
 
 
 # Per-doc cap on how much RFP text the Outline Agent sees. Section L/M is
 # usually in the first 30-50 pages; cap at 60K chars (~15K tokens) per doc to
-# Shared FK-safe stage-message logger; aliased so existing call sites
-# in this module stay unchanged.
-from app.services.stages import record_stage as _set_stage  # noqa: E402
-
-
 def _build_rfp_text_excerpt(proposal_id: int) -> str:
     """Concatenate every parsed RFP document's full text. No truncation
     — the Outline Agent benefits from seeing the entire RFP (Section
@@ -197,13 +194,18 @@ def run_outline_generation(proposal_id: int) -> None:
     Re-running this clears any prior ProposalSection rows (drafts included).
     See replace_outline() for the rationale.
     """
+    require_proposal_mutable(proposal_id, operation="generate outline")
     log.info("outline generation starting for proposal %d", proposal_id)
     try:
         _set_stage(proposal_id, "Building outline context (profile + KB + RFP text)…")
 
         compliance_dicts, gap_dicts, submission_directives = _snapshot_compliance_and_gaps(proposal_id)
         if not compliance_dicts:
-            _set_stage(proposal_id, "No compliance items — cannot outline. Run intake first.")
+            _set_stage(
+                proposal_id,
+                "No compliance items — cannot outline. Run intake first.",
+                status="failed",
+            )
             return
         if submission_directives:
             log.info(
@@ -232,7 +234,11 @@ def run_outline_generation(proposal_id: int) -> None:
         )
 
         if not sections:
-            _set_stage(proposal_id, "Outline Agent returned no sections — check logs.")
+            _set_stage(
+                proposal_id,
+                "Outline Agent returned no sections — check logs.",
+                status="failed",
+            )
             return
 
         # Sanity check: every requirement_id should appear in exactly one section.
@@ -272,7 +278,11 @@ def run_outline_generation(proposal_id: int) -> None:
 
     except Exception:
         log.exception("outline generation failed for proposal %d", proposal_id)
-        _set_stage(proposal_id, "Outline generation failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Outline generation failed — check logs.",
+            status="failed",
+        )
 
 
 def spawn_outline_generation(proposal_id: int) -> threading.Thread:

@@ -12,11 +12,30 @@
 [CmdletBinding()]
 param(
     [string]$Url = 'http://localhost:8000',
-    [int]$DelaySeconds = 4
+    [int]$TimeoutSeconds = 30
 )
 
-# Wait for the server to bind. NiceGUI takes ~3-4s on cold start.
-Start-Sleep -Seconds $DelaySeconds
+# Poll the real health endpoint so a process that never binds does not open a
+# dead browser window. The timeout is bounded and failures remain non-fatal.
+$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+$healthy = $false
+do {
+    try {
+        $response = Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 2
+        if ($response.StatusCode -eq 200) {
+            $healthy = $true
+            break
+        }
+    } catch {
+        # Expected while NiceGUI is still starting; retry until the deadline.
+    }
+    Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+
+if (-not $healthy) {
+    Write-Warning "RFP Factory did not become healthy within $TimeoutSeconds seconds. Browser was not opened."
+    exit 1
+}
 
 # Chrome can be in any of three standard locations depending on
 # whether it was installed system-wide via the .msi (Program Files /

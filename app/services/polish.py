@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from app.db.session import SessionLocal, session_scope
 from app.models import PolishEdit
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ def record_polish_edit(
     draft succeeded).
     """
     with session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="record final polish edit",
+        )
         row = PolishEdit(
             proposal_id=proposal_id,
             proposal_section_id=proposal_section_id,

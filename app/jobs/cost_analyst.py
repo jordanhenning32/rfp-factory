@@ -37,6 +37,7 @@ from app.services.pricing import (
     compute_scenario_packages,
     upsert_pricing_packages,
 )
+from app.services.proposal_access import require_proposal_mutable
 from app.services.stages import record_stage as _set_stage
 from app.services.team import (
     format_team_roster_for_cost_analyst,
@@ -91,21 +92,22 @@ def _snapshot_cost_analyst_inputs(proposal_id: int) -> dict | None:
                 t = (text or "").strip()
                 if not t:
                     continue
-                if scope_total + len(t) + 2 > 3500:
-                    break
-                scope_chunks.append(t)
-                scope_total += len(t) + 2
+                if scope_total + len(t) + 2 <= 3500:
+                    scope_chunks.append(t)
+                    scope_total += len(t) + 2
         scope_summary = "\n\n".join(scope_chunks)
 
         if not scope_summary:
-            doc = db.execute(
+            doc_texts = db.execute(
                 select(RfpPackageDocument.extracted_text_md)
                 .where(
                     RfpPackageDocument.rfp_package_id == prop.rfp_package_id,
                 )
-                .limit(1)
-            ).scalar_one_or_none()
-            scope_summary = (doc or "")[:3500]
+                .order_by(RfpPackageDocument.id)
+            ).scalars().all()
+            scope_summary = "\n\n".join(
+                text.strip() for text in doc_texts if text and text.strip()
+            )[:3500]
 
         # Outline section briefs — section_title + section_brief per
         # row, formatted as a compact block. The agent uses these to
@@ -143,6 +145,8 @@ def _snapshot_cost_analyst_inputs(proposal_id: int) -> dict | None:
     est_value_high = est_fte * annual_hours_per_fte * _FALLBACK_RATE_HIGH_USD_PER_HR * (pop_months / 12.0)
 
     quadratic_summary = _build_quadratic_summary()
+    from app.services.cost_matrix import get_cost_matrix_requirements_context
+    cost_matrix_requirements = get_cost_matrix_requirements_context(proposal_id)
 
     return {
         "rfp_title": rfp_title,
@@ -154,6 +158,7 @@ def _snapshot_cost_analyst_inputs(proposal_id: int) -> dict | None:
         "scope_summary": scope_summary,
         "outline_briefs": outline_briefs,
         "quadratic_summary": quadratic_summary,
+        "cost_matrix_requirements": cost_matrix_requirements,
     }
 
 
@@ -181,6 +186,7 @@ def run_cost_analyst(proposal_id: int) -> None:
     """Sync entry point. Loads inputs (including the persisted market
     scan), runs the LLM, applies math, persists. Catches all
     exceptions and surfaces via stage banner."""
+    require_proposal_mutable(proposal_id, operation="run cost analysis")
     log.info("cost analyst starting for proposal %d", proposal_id)
     try:
         _set_stage(
@@ -192,6 +198,7 @@ def run_cost_analyst(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 f"Cost Analyst: proposal {proposal_id} not found.",
+                status="failed",
             )
             return
 
@@ -203,6 +210,7 @@ def run_cost_analyst(proposal_id: int) -> None:
                 "proposal — run Market Research first (Cost tab → "
                 "'Run Market Research'). Cost build needs the band "
                 "for vs-market positioning.",
+                status="failed",
             )
             return
 
@@ -256,6 +264,7 @@ def run_cost_analyst(proposal_id: int) -> None:
             market_scan_snapshot=market_scan,
             quadratic_summary=inputs["quadratic_summary"],
             team_roster_block=roster_block,
+            cost_matrix_requirements=inputs["cost_matrix_requirements"],
         )
 
         if roster_driven:
@@ -377,6 +386,7 @@ def run_cost_analyst(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             "Cost Analyst failed — check logs.",
+            status="failed",
         )
 
 

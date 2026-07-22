@@ -172,6 +172,11 @@ SCOPE-SIMILARITY DISCIPLINE:
 - Awards more than 5× outside that range (either direction — too small or too large) are NOT comparable for band calculation. They distort the band by anchoring on scope the bidder can't deliver or wouldn't be asked to. Example: if est_value_range is $500K-$1M, a $25M multi-year platform contract is a 25× outlier — exclude it.
 - If a far-outside-range award is genuinely informative (e.g., it reveals an unusual market signal worth surfacing), you may include it — but mark relevance_score ≤ 0.3 and explain in notes WHY it's an outlier and what it tells you. Do not let outliers drive the band.
 
+IMPORTANT OVERRIDE ON THE ROUGH RANGE:
+- The rough value range in the user prompt is an internal, low-confidence query-scoping aid. It is not buyer budget, not a target price, and not evidence.
+- Do NOT anchor the market band on that rough range. The band must come from cited comparable awards with disclosed values, preferably normalized to this RFP's period of performance.
+- If fewer than two valued comparable awards are found, leave the band unknown/null and flag insufficient data instead of estimating from the rough range.
+
 ORDER: Most relevant comparable awards first. Most likely-to-bid competitors first."""
 
 
@@ -183,7 +188,7 @@ Customer agency: {rfp_agency}
 NAICS: {naics}
 Period of performance: ~{pop_months} months
 Estimated FTE count (rough): {est_fte}
-Estimated contract value range (rough, for query scoping): ${est_value_low_usd:,.0f} - ${est_value_high_usd:,.0f}
+Internal rough sanity range (low-confidence; do NOT anchor the band): ${est_value_low_usd:,.0f} - ${est_value_high_usd:,.0f}
 
 === Brief scope ===
 {scope_summary}

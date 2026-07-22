@@ -22,17 +22,18 @@ as JSON on proposals.evaluation_criteria_json (migration 0032).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import json_repair
 
-from app.config import get_settings
+from app.config import DATA_DIR, get_settings
 from app.services.llm import fmt_llm_usage, get_anthropic
 
 log = logging.getLogger(__name__)
@@ -358,21 +359,21 @@ def _dump_failed_payload(
     filename: str,
     parse_error: str,
 ) -> Path | None:
-    """Write a malformed tool-input payload to disk for operator inspection.
-    Returns the dump path on success, None on failure."""
+    """Write non-sensitive parse diagnostics without persisting source text."""
     try:
-        dump_dir = Path("data/debug/section_m_extractor")
+        dump_dir = DATA_DIR / "debug" / "section_m_extractor"
         dump_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
         safe_name = re.sub(r"[^\w-]", "_", filename)[:80]
         dump_path = dump_dir / f"{ts}_{safe_name}.txt"
         header = (
             f"# parse_error: {parse_error}\n"
             f"# filename: {filename}\n"
             f"# raw_len: {len(raw)}\n"
-            f"# --- raw tool input below this line ---\n"
+            f"# raw_sha256: {hashlib.sha256(raw.encode('utf-8')).hexdigest()}\n"
+            "# raw payload intentionally omitted\n"
         )
-        dump_path.write_text(header + raw, encoding="utf-8")
+        dump_path.write_text(header, encoding="utf-8")
         return dump_path
     except Exception:  # noqa: BLE001 — best-effort debug aid
         log.exception("section_m_extractor: failed to write debug dump")
@@ -446,7 +447,7 @@ def _extract_one_chunk(
             )
             log.error(
                 "section_m_extractor: unrecoverable parse failure for %s — "
-                "dump at %s. Returning empty criteria.",
+                "diagnostic metadata at %s. Returning empty criteria.",
                 filename,
                 dump_path,
             )
@@ -456,7 +457,10 @@ def _extract_one_chunk(
                 section_l_to_m_map={},
                 trade_off_language=None,
                 lowest_price_clause=None,
-                extraction_notes=f"Parse failure (string tool input, unrecoverable) — dump: {dump_path}",
+                extraction_notes=(
+                    "Parse failure (string tool input, unrecoverable) — "
+                    f"diagnostic metadata: {dump_path}"
+                ),
             )
 
     if not isinstance(tool_input, dict):

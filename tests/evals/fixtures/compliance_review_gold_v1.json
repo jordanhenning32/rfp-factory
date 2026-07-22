@@ -1,0 +1,267 @@
+{
+  "version": "1.0",
+  "description": "Synthetic, non-proprietary requirements-review gold set.",
+  "cases": [
+    {
+      "id": "clean_mandatory_technical",
+      "source_text": "--- Page 1 ---\nThe contractor shall encrypt all stored customer data using an agency-approved algorithm.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The contractor shall encrypt all stored customer data using an agency-approved algorithm.",
+          "requirement_type": "shall",
+          "category": "technical",
+          "source_page": 1
+        }
+      ],
+      "expected": {"findings": [], "missing_requirements": []}
+    },
+    {
+      "id": "mandatory_verb_misclassified",
+      "source_text": "--- Page 1 ---\nThe offeror must provide a disaster recovery plan.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The offeror must provide a disaster recovery plan.",
+          "requirement_type": "should",
+          "category": "technical",
+          "source_page": 1
+        }
+      ],
+      "expected": {
+        "findings": [
+          {"requirement_id": "REQ-001", "issue": "type_misclassified", "suggested_type": "must"}
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "content_not_submission_format",
+      "source_text": "--- Page 2 ---\nDescribe the proposed approach to stakeholder engagement.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "Describe the proposed approach to stakeholder engagement.",
+          "requirement_type": "submission_format",
+          "category": "management",
+          "source_page": 2
+        }
+      ],
+      "expected": {
+        "findings": [
+          {"requirement_id": "REQ-001", "issue": "type_misclassified", "suggested_type": "should"}
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "page_limit_rule",
+      "source_text": "--- Page 3 ---\nThe technical volume shall not exceed twenty pages and must use 11-point Arial font.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The technical volume shall not exceed twenty pages and must use 11-point Arial font.",
+          "requirement_type": "shall",
+          "category": "technical",
+          "source_page": 3
+        }
+      ],
+      "expected": {
+        "findings": [
+          {
+            "requirement_id": "REQ-001",
+            "issue": "type_and_category_misclassified",
+            "suggested_type": "submission_format",
+            "suggested_category": "administrative"
+          }
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "required_form_category",
+      "source_text": "--- Page 4 ---\nThe offeror must attach a signed conflicts-of-interest certification to Volume I.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The offeror must attach a signed conflicts-of-interest certification to Volume I.",
+          "requirement_type": "must",
+          "category": "technical",
+          "source_page": 4
+        }
+      ],
+      "expected": {
+        "findings": [
+          {
+            "requirement_id": "REQ-001",
+            "issue": "type_and_category_misclassified",
+            "suggested_type": "mandatory_form",
+            "suggested_category": "certification"
+          }
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "evaluation_weight",
+      "source_text": "--- Page 5 ---\nTechnical approach will be evaluated at 60 points; past performance will be evaluated at 40 points.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "Technical approach will be evaluated at 60 points; past performance will be evaluated at 40 points.",
+          "requirement_type": "should",
+          "category": "administrative",
+          "source_page": 5
+        }
+      ],
+      "expected": {
+        "findings": [
+          {
+            "requirement_id": "REQ-001",
+            "issue": "type_misclassified",
+            "suggested_type": "evaluation_criterion"
+          }
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "heading_not_requirement",
+      "source_text": "--- Page 6 ---\nSECTION L — PROPOSAL INSTRUCTIONS\nThe offeror shall submit one technical volume.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "SECTION L — PROPOSAL INSTRUCTIONS",
+          "requirement_type": "shall",
+          "category": "administrative",
+          "source_page": 6
+        },
+        {
+          "requirement_id": "REQ-002",
+          "requirement_text": "The offeror shall submit one technical volume.",
+          "requirement_type": "shall",
+          "category": "administrative",
+          "source_page": 6
+        }
+      ],
+      "expected": {
+        "findings": [
+          {"requirement_id": "REQ-001", "issue": "text_is_a_header_not_a_requirement"}
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "truncated_requirement",
+      "source_text": "--- Page 7 ---\nThe contractor shall deliver monthly status reports that include schedule, risk, cost, and quality metrics.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The contractor shall deliver monthly status reports that include…",
+          "requirement_type": "shall",
+          "category": "management",
+          "source_page": 7
+        }
+      ],
+      "expected": {
+        "findings": [
+          {"requirement_id": "REQ-001", "issue": "text_is_truncated_or_incomplete"}
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "duplicate_rows",
+      "source_text": "--- Page 8 ---\nThe contractor shall maintain a staffed service desk during business hours.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The contractor shall maintain a staffed service desk during business hours.",
+          "requirement_type": "shall",
+          "category": "technical",
+          "source_page": 8
+        },
+        {
+          "requirement_id": "REQ-002",
+          "requirement_text": "The contractor shall maintain a staffed service desk during business hours.",
+          "requirement_type": "shall",
+          "category": "technical",
+          "source_page": 8
+        }
+      ],
+      "expected": {
+        "findings": [
+          {"requirement_id": "REQ-002", "issue": "duplicate_of_other_item"}
+        ],
+        "missing_requirements": []
+      }
+    },
+    {
+      "id": "intentional_omission_certification",
+      "source_text": "--- Page 9 ---\nThe contractor shall comply with NIST SP 800-53 controls.\nThe offeror must include a current SOC 2 Type II report with its submission.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "The contractor shall comply with NIST SP 800-53 controls.",
+          "requirement_type": "shall",
+          "category": "technical",
+          "source_page": 9
+        }
+      ],
+      "expected": {
+        "findings": [],
+        "missing_requirements": [
+          {
+            "requirement_text": "The offeror must include a current SOC 2 Type II report with its submission.",
+            "source_page": 9,
+            "requirement_type": "mandatory_form",
+            "category": "certification",
+            "weight": null,
+            "confidence": "HIGH"
+          }
+        ],
+        "critical_missing": true
+      }
+    },
+    {
+      "id": "bare_imperative_parent_context",
+      "source_text": "--- Page 10 ---\nThe offeror shall address each item below:\nDescribe the transition approach.\nProvide the staffing schedule.",
+      "items": [
+        {
+          "requirement_id": "REQ-001",
+          "requirement_text": "Describe the transition approach.",
+          "requirement_type": "shall",
+          "category": "management",
+          "source_page": 10
+        },
+        {
+          "requirement_id": "REQ-002",
+          "requirement_text": "Provide the staffing schedule.",
+          "requirement_type": "shall",
+          "category": "personnel",
+          "source_page": 10
+        }
+      ],
+      "expected": {"findings": [], "missing_requirements": []}
+    },
+    {
+      "id": "pricing_omission",
+      "source_text": "--- Page 11 ---\nOfferors shall enter fully burdened hourly rates for every labor category in the supplied pricing workbook.",
+      "items": [],
+      "expected": {
+        "findings": [],
+        "missing_requirements": [
+          {
+            "requirement_text": "Offerors shall enter fully burdened hourly rates for every labor category in the supplied pricing workbook.",
+            "source_page": 11,
+            "requirement_type": "shall",
+            "category": "pricing",
+            "weight": null,
+            "confidence": "HIGH"
+          }
+        ],
+        "critical_missing": true
+      }
+    }
+  ]
+}

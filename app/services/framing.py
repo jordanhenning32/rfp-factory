@@ -29,12 +29,14 @@ from sqlalchemy import select
 from app.db.session import session_scope
 from app.models.compliance import GapAnalysis
 from app.models.proposal import Proposal
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
 
 _VALID_TEAMING = {None, "open", "self_perform_only"}
 _VALID_BUILD = {None, "custom_build_first", "self_perform_first"}
+_UNSET = object()
 
 
 def set_framing(
@@ -51,7 +53,9 @@ def set_framing(
     if build_framing not in _VALID_BUILD:
         raise ValueError(f"invalid build_framing: {build_framing!r}")
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="change proposal framing",
+        )
         if p is None:
             return
         p.teaming_framing = teaming_framing
@@ -66,6 +70,41 @@ def get_framing(proposal_id: int) -> tuple[str | None, str | None]:
         if p is None:
             return (None, None)
         return (p.teaming_framing, p.build_framing)
+
+
+def update_gap_resolution(
+    gap_pk: int,
+    *,
+    selected_index=_UNSET,
+    selected_partner=_UNSET,
+    resolved=_UNSET,
+    notes=_UNSET,
+) -> bool:
+    """Persist the user-controlled fields on one gap.
+
+    Omitted fields are left unchanged; passing ``None`` explicitly clears a
+    nullable value.  Changing the mitigation without a paired partner clears
+    the old partner because it no longer describes the selected option.
+    """
+    with session_scope() as db:
+        gap = db.get(GapAnalysis, gap_pk)
+        if gap is None:
+            return False
+        ensure_proposal_mutable(
+            db, gap.proposal_id, operation="change gap resolution",
+        )
+        if selected_index is not _UNSET:
+            old_index = gap.selected_mitigation_index
+            gap.selected_mitigation_index = selected_index
+            if selected_partner is _UNSET and old_index != selected_index:
+                gap.selected_partner_name = None
+        if selected_partner is not _UNSET:
+            gap.selected_partner_name = selected_partner
+        if resolved is not _UNSET:
+            gap.resolved = bool(resolved)
+        if notes is not _UNSET:
+            gap.resolution_notes = notes
+    return True
 
 
 def pick_mitigation_for_framing(
@@ -131,7 +170,9 @@ def apply_framing_to_unaddressed_gaps(proposal_id: int) -> dict:
     counts = {"applied": 0, "no_match": 0, "skipped": 0, "reason": ""}
 
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="apply proposal framing",
+        )
         if p is None:
             counts["reason"] = "proposal not found"
             return counts

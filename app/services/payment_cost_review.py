@@ -10,23 +10,167 @@ PricingPackage rows so findings live on the proposal directly.
 User actions on findings (Accept / Reject / Edit / Refine with AI)
 all flow through `update_payment_finding_action` — read the JSON,
 mutate the matching finding's user_action / user_note, write back.
-The orchestrator's persist path overwrites the blob in full on a
-fresh review run; user mutations are single-finding patches.
+Fresh review runs replace stale findings while carrying triage forward
+for logically identical findings.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from typing import Any
 
 from app.db.session import session_scope
 from app.models import Proposal
+from app.services.proposal_access import (
+    acquire_proposal_write_fence,
+    ensure_proposal_mutable,
+    proposal_write_lock,
+)
+from app.services.review_freshness import (
+    PAYMENT_REVIEW_PROVENANCE_KEY,
+    build_payment_review_provenance,
+)
 
 log = logging.getLogger(__name__)
 
 
 _VALID_ACTIONS = ("pending", "accepted", "rejected")
+
+
+def _normalize_identity_part(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _payment_finding_key(finding: dict[str, Any]) -> tuple[str, ...]:
+    """Stable identity independent of sequential PCR IDs and result order."""
+    return tuple(
+        _normalize_identity_part(finding.get(field))
+        for field in (
+            "section_id",
+            "severity",
+            "category",
+            "finding_text",
+            "cited_quote",
+        )
+    )
+
+
+def _payment_triage_state(finding: dict[str, Any]) -> dict[str, Any]:
+    action = str(finding.get("user_action") or "pending").strip().lower()
+    if action not in _VALID_ACTIONS:
+        action = "pending"
+    return {
+        "user_action": action,
+        "user_note": finding.get("user_note"),
+    }
+
+
+def _payment_triage_priority(state: dict[str, Any]) -> tuple[int, int]:
+    return (
+        int(state["user_action"] in {"accepted", "rejected"}),
+        int(bool(state["user_note"])),
+    )
+
+
+def merge_payment_cost_review_triage(
+    previous_data: dict[str, Any],
+    current_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the new review payload with matching human triage restored.
+
+    ``finding_id`` is intentionally excluded from identity because the agent
+    assigns sequential PCR IDs on every run. Findings absent from the current
+    result disappear, and genuinely new findings are forced to pending with no
+    user note.
+    """
+    triage_by_key: dict[tuple[str, ...], dict[str, Any]] = {}
+    for finding in previous_data.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        key = _payment_finding_key(finding)
+        candidate = _payment_triage_state(finding)
+        current = triage_by_key.get(key)
+        if (
+            current is None
+            or _payment_triage_priority(candidate)
+            > _payment_triage_priority(current)
+        ):
+            triage_by_key[key] = candidate
+
+    merged = deepcopy(current_data)
+    for finding in merged.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        finding["user_action"] = "pending"
+        finding["user_note"] = None
+        prior = triage_by_key.get(_payment_finding_key(finding))
+        if prior is not None:
+            finding.update(prior)
+    return merged
+
+
+def persist_payment_cost_review_data(
+    proposal_id: int,
+    current_data: dict[str, Any],
+    *,
+    reviewed_provenance: dict[str, str] | None = None,
+) -> bool:
+    """Persist only when the inputs actually reviewed are still current."""
+    from app.services.service_line import payment_cost_basis_lock
+
+    with proposal_write_lock(proposal_id):
+        with payment_cost_basis_lock():
+            with session_scope() as db:
+                acquire_proposal_write_fence(db, proposal_id)
+                proposal = ensure_proposal_mutable(
+                    db, proposal_id, operation="persist payment cost review",
+                )
+                if proposal is None:
+                    return False
+
+                previous_data: dict[str, Any] = {}
+                raw = proposal.payment_cost_review_findings_json or ""
+                if raw.strip():
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            previous_data = parsed
+                    except json.JSONDecodeError:
+                        log.warning(
+                            "payment_cost_review_findings_json invalid JSON on "
+                            "proposal %d; persisting fresh review without "
+                            "triage carry-forward",
+                            proposal_id,
+                        )
+
+                current_provenance = build_payment_review_provenance(
+                    proposal_id,
+                    db=db,
+                )
+                if current_provenance is None:
+                    return False
+                if (
+                    reviewed_provenance is not None
+                    and reviewed_provenance != current_provenance
+                ):
+                    return False
+                provenance = reviewed_provenance or current_provenance
+                current_with_provenance = deepcopy(current_data)
+                current_with_provenance[
+                    PAYMENT_REVIEW_PROVENANCE_KEY
+                ] = provenance
+                merged = merge_payment_cost_review_triage(
+                    previous_data,
+                    current_with_provenance,
+                )
+                proposal.payment_cost_review_findings_json = json.dumps(
+                    merged,
+                    indent=2,
+                    default=str,
+                )
+    return True
 
 
 def get_payment_cost_review_data(proposal_id: int) -> dict[str, Any]:
@@ -89,7 +233,9 @@ def update_payment_finding_action(
         raise ValueError(f"unknown action {action!r}; expected one of {_VALID_ACTIONS}")
 
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="triage payment cost finding",
+        )
         if p is None:
             return None
         raw = p.payment_cost_review_findings_json
@@ -141,7 +287,9 @@ def update_payment_finding_user_note(
     accept / reject. To save the edit AND mark accepted in one shot,
     call `update_payment_finding_action(action='accepted', user_note=...)`."""
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="edit payment cost finding",
+        )
         if p is None:
             return None
         raw = p.payment_cost_review_findings_json
@@ -206,7 +354,9 @@ def bulk_accept_pending_payment_findings(
     skipped_below = 0
 
     with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
+        p = ensure_proposal_mutable(
+            db, proposal_id, operation="triage payment cost findings",
+        )
         if p is None:
             return {
                 "accepted": 0,
@@ -318,6 +468,8 @@ def count_accepted_payment_findings(proposal_id: int) -> int:
 
 
 __all__ = [
+    "merge_payment_cost_review_triage",
+    "persist_payment_cost_review_data",
     "get_payment_cost_review_data",
     "get_payment_cost_review_findings",
     "update_payment_finding_action",

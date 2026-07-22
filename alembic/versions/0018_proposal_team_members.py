@@ -6,14 +6,14 @@ Create Date: 2026-04-28
 
 Front-loads team composition so the Writer Team has named personnel
 + time allocations + labor categories baked into its cached prefix
-when drafting. Eliminates the "% time PM/CTO/Pandey" and personnel-
+when drafting. Eliminates the "% time PM/CTO" and personnel-
 detail [NEEDS_HUMAN] placeholder buckets the writer was emitting
 for lack of upstream data.
 
 One row per role on the proposed delivery team:
   role_name           — what they do (PM, Solution Architect, BA II, ...)
   person_kind         — named / tbh / sub  (drives display + cost-analyst input)
-  assigned_person     — "Andy Parr" / "TBH" / "Sub: Nava PBC"
+  assigned_person     — "Alex Rivera" / "TBH" / "Sub: Example Partner"
   labor_category      — GSA OLM mapping (used by Cost Analyst later)
   wage_band           — "$170K" / "$95K" — same vocab as internal_pricing_rules
   time_allocation_pct — 0-100, share of full-time over PoP
@@ -29,15 +29,16 @@ consume this roster as input.
 """
 from __future__ import annotations
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "0018"
-down_revision: Union[str, None] = "0017"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "0017"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

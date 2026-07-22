@@ -73,6 +73,8 @@ class CostEstimate:
     # Intake phase (runs immediately on Run-click)
     intake_metadata: float
     compliance_matrix: float
+    compliance_review: float
+    compliance_fallback_contingency: float
     shortfall: float
     intake_total: float
     # Post-intake phases (user-driven, run later)
@@ -86,6 +88,9 @@ class CostEstimate:
     tokens_estimated: int
     requirements_estimated: int
     sections_estimated: int
+    compliance_extraction_model: str
+    compliance_review_model: str
+    compliance_fallback_model: str
 
 
 def estimate_pipeline_cost(staged_files: dict[str, bytes]) -> CostEstimate:
@@ -109,10 +114,34 @@ def estimate_pipeline_cost(staged_files: dict[str, bytes]) -> CostEstimate:
         800,
     )
 
-    # Compliance Matrix Agent — Sonnet/drafter; full RFP in, ~80 tokens
-    # of output per requirement extracted.
+    # Compliance Matrix Agent — configured source extractor; full RFP in,
+    # ~80 tokens of output per requirement extracted.
     cm_out = max(2_000, n_reqs * 80)
-    compliance_matrix = _cost(settings.model_drafter, rfp_tokens, cm_out)
+    compliance_matrix = _cost(
+        settings.model_compliance_matrix,
+        rfp_tokens,
+        cm_out,
+    )
+
+    # Independent requirements review has two calls over the material:
+    # batched item classification plus source-aware completeness. Include
+    # prompt/batch overhead and a small fallback contingency rather than
+    # presenting the extraction call as the entire compliance cost.
+    review_batches = max(1, (n_reqs + 24) // 25)
+    classification_in = n_reqs * 110 + review_batches * 900
+    classification_out = max(250, n_reqs * 15)
+    completeness_in = rfp_tokens + n_reqs * 95 + 1_200
+    completeness_out = max(400, n_reqs * 12)
+    compliance_review = _cost(
+        settings.model_compliance_validator,
+        classification_in + completeness_in,
+        classification_out + completeness_out,
+    )
+    compliance_fallback_contingency = 0.10 * _cost(
+        settings.model_compliance_validator_fallback,
+        classification_in + completeness_in,
+        classification_out + completeness_out,
+    )
 
     # Shortfall Strategist — Sonnet, batched at _SHORTFALL_BATCH_SIZE.
     # First batch writes the cache; subsequent batches read it.
@@ -133,7 +162,13 @@ def estimate_pipeline_cost(staged_files: dict[str, bytes]) -> CostEstimate:
     )
     shortfall = sf_first + sf_rest
 
-    intake_total = intake_metadata + compliance_matrix + shortfall
+    intake_total = (
+        intake_metadata
+        + compliance_matrix
+        + compliance_review
+        + compliance_fallback_contingency
+        + shortfall
+    )
 
     # ---------- Post-intake (user-driven, run later) ----------
 
@@ -188,6 +223,8 @@ def estimate_pipeline_cost(staged_files: dict[str, bytes]) -> CostEstimate:
     return CostEstimate(
         intake_metadata=intake_metadata,
         compliance_matrix=compliance_matrix,
+        compliance_review=compliance_review,
+        compliance_fallback_contingency=compliance_fallback_contingency,
         shortfall=shortfall,
         intake_total=intake_total,
         outline=outline_cost,
@@ -199,6 +236,9 @@ def estimate_pipeline_cost(staged_files: dict[str, bytes]) -> CostEstimate:
         tokens_estimated=rfp_tokens,
         requirements_estimated=n_reqs,
         sections_estimated=n_sections,
+        compliance_extraction_model=settings.model_compliance_matrix,
+        compliance_review_model=settings.model_compliance_validator,
+        compliance_fallback_model=settings.model_compliance_validator_fallback,
     )
 
 

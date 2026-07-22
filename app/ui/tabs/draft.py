@@ -1015,8 +1015,9 @@ def _render_draft_tab(
     @ui.refreshable
     def render() -> None:
         # Defensive reconcile — guarantee every inline [NEEDS_HUMAN: …] marker
-        # has a JSON entry before we snapshot. Cheap (regex over the draft);
-        # only commits if anything actually changed.
+        # has a JSON entry before we snapshot. Archived proposals are immutable
+        # audit records, so their read-only render must never invoke this
+        # mutator (and should not emit expected guard failures as server errors).
         with SessionLocal() as db:
             sec_pks = [
                 row[0]
@@ -1024,11 +1025,14 @@ def _render_draft_tab(
                     select(ProposalSection.id).where(ProposalSection.proposal_id == proposal_id)
                 ).all()
             ]
-        for spk in sec_pks:
-            try:
-                reconcile_placeholders(spk)
-            except Exception:
-                log.exception("reconcile_placeholders failed for section pk=%d", spk)
+        if status_val != "archived":
+            for spk in sec_pks:
+                try:
+                    reconcile_placeholders(spk)
+                except Exception:
+                    log.exception(
+                        "reconcile_placeholders failed for section pk=%d", spk
+                    )
 
         with SessionLocal() as db:
             sec_rows = (
@@ -1073,22 +1077,40 @@ def _render_draft_tab(
             return
 
         n_total = len(sections)
-        n_cost_deferred = sum(1 for s in sections if s["requires_cost_analysis"])
-        n_writer_eligible = n_total - n_cost_deferred
-        n_drafted = sum(1 for s in sections if s["draft_md"] and not s["requires_cost_analysis"])
+        n_cost_sections = sum(1 for s in sections if s["requires_cost_analysis"])
+        n_cost_drafted = sum(
+            1 for s in sections
+            if s["requires_cost_analysis"] and s["draft_md"]
+        )
+        n_cost_pending = n_cost_sections - n_cost_drafted
+        n_writer_eligible = n_total - n_cost_sections
+        n_drafted = sum(
+            1 for s in sections if s["draft_md"] and not s["requires_cost_analysis"]
+        )
         n_missing = max(0, n_writer_eligible - n_drafted)
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center justify-between w-full"):
                 with ui.column().classes("gap-0"):
-                    ui.label(f"{n_drafted} of {n_writer_eligible} section(s) drafted").classes(
-                        "text-base font-semibold"
-                    )
-                    if n_cost_deferred:
+                    ui.label(
+                        f"{n_drafted} of {n_writer_eligible} Writer Team "
+                        f"section{'s' if n_writer_eligible != 1 else ''} drafted"
+                    ).classes("text-base font-semibold")
+                    if n_cost_sections:
+                        cost_summary = (
+                            f"+ {n_cost_drafted} of {n_cost_sections} cost "
+                            f"section{'s' if n_cost_sections != 1 else ''} "
+                            "drafted by the Cost Volume Writer"
+                        )
+                        if n_cost_pending:
+                            cost_summary += (
+                                f" · {n_cost_pending} waiting"
+                            )
                         ui.label(
-                            f"+ {n_cost_deferred} cost-deferred section"
-                            f"{'s' if n_cost_deferred != 1 else ''} "
-                            f"(awaiting Cost Analysis Agent, Weeks 12-13)"
-                        ).classes("text-xs opacity-70")
+                            cost_summary
+                        ).classes(
+                            "text-xs opacity-70" if n_cost_pending
+                            else "text-xs text-green-700"
+                        )
                 if live_status == "draft_in_progress":
                     # Writer Team is currently running. Show the live
                     # spinner and a "Force restart" escape hatch — the
@@ -1268,14 +1290,13 @@ def _render_draft_tab(
                         with ui.row().classes("items-start gap-3 w-full"):
                             ui.icon("payments").classes("text-purple-700 text-2xl pt-0.5")
                             with ui.column().classes("gap-0 flex-1"):
-                                ui.label("Awaiting Cost Analysis Agent (Weeks 12-13)").classes(
-                                    "text-sm font-semibold text-purple-900"
-                                )
                                 ui.label(
-                                    "This section will be drafted after the "
-                                    "Cost Analysis Agent produces the pricing "
-                                    "numbers and P&L. Until then it stays empty "
-                                    "by design — no point in pasting "
+                                    "Waiting for the Cost Volume Writer"
+                                ).classes("text-sm font-semibold text-purple-900")
+                                ui.label(
+                                    "This section is drafted separately after "
+                                    "the pricing build is ready. Until then it "
+                                    "stays empty by design — no point in pasting "
                                     "[NEEDS_HUMAN: $X] placeholders the agent "
                                     "would have to overwrite."
                                 ).classes("text-xs text-purple-800 pt-1")

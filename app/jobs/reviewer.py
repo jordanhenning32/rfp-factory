@@ -32,6 +32,8 @@ import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
@@ -41,9 +43,10 @@ from app.agents.reviewer_b import build_cached_prefix as build_b_prefix
 from app.agents.reviewer_b import review_section as review_b
 from app.config import get_settings
 from app.core.company_profile import get_company_profile
-from app.core.enums import ProposalStatus
+from app.core.enums import AgentRunStatus, ProposalStatus
 from app.db.session import SessionLocal, session_scope
 from app.models import (
+    AgentRun,
     ComplianceMatrixItem,
     GapAnalysis,
     Proposal,
@@ -53,7 +56,6 @@ from app.models import (
 from app.services.cancellation import (
     JOB_AUTO_REVIEW,
     add_active_section,
-    clear_active_sections,
     remove_active_section,
 )
 from app.services.cancellation import (
@@ -73,6 +75,11 @@ from app.services.findings import (
     persist_findings,
 )
 from app.services.kb_context import build_shortfall_kb_context
+from app.services.proposal_access import require_proposal_mutable
+from app.services.review_coverage import (
+    REVIEW_COVERAGE_AGENT,
+    review_coverage_prompt_version,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +87,77 @@ log = logging.getLogger(__name__)
 # Shared FK-safe stage-message logger; aliased so existing call sites
 # in this module stay unchanged.
 from app.services.stages import record_stage as _set_stage  # noqa: E402
+
+
+@dataclass(frozen=True)
+class SectionReviewResult:
+    """Outcome of the composite review operation for one section.
+
+    Finding counts alone cannot distinguish a genuinely clean response from a
+    provider or persistence failure.  ``failures`` makes that distinction
+    explicit while still allowing the healthy reviewer to finish when its
+    peer fails.
+    """
+
+    n_findings_a: int = 0
+    n_findings_b: int = 0
+    failures: tuple[str, ...] = ()
+
+    @property
+    def succeeded(self) -> bool:
+        return not self.failures
+
+    def __iter__(self):
+        """Preserve the private helper's historical two-count unpacking."""
+        yield self.n_findings_a
+        yield self.n_findings_b
+
+
+def _start_review_coverage_attempt(
+    proposal_id: int,
+    section_pk: int,
+    revision: int,
+) -> int:
+    """Persist a RUNNING marker before any destructive review bookkeeping."""
+    now = datetime.now(UTC)
+    with session_scope() as db:
+        marker = AgentRun(
+            proposal_id=proposal_id,
+            agent_name=REVIEW_COVERAGE_AGENT,
+            model_used=None,
+            prompt_version=review_coverage_prompt_version(section_pk, revision),
+            started_at=now,
+            status=AgentRunStatus.RUNNING,
+        )
+        db.add(marker)
+        db.flush()
+        marker_id = marker.id
+    return marker_id
+
+
+def _finish_review_coverage_attempt(
+    marker_id: int,
+    *,
+    succeeded: bool,
+    error_text: str | None = None,
+) -> None:
+    """Finalize one section/revision marker.
+
+    A missing marker is an integrity failure, not a best-effort logging issue:
+    without it submission readiness cannot prove that the section was fully
+    reviewed.
+    """
+    with session_scope() as db:
+        marker = db.get(AgentRun, marker_id)
+        if marker is None:
+            raise RuntimeError(
+                f"review coverage marker {marker_id} disappeared before completion"
+            )
+        marker.status = (
+            AgentRunStatus.COMPLETED if succeeded else AgentRunStatus.FAILED
+        )
+        marker.completed_at = datetime.now(UTC)
+        marker.error_text = (error_text or "")[:2000] or None
 
 
 def _build_rfp_text_excerpt(proposal_id: int) -> str:
@@ -179,6 +257,7 @@ def _snapshot_review_inputs(proposal_id: int) -> dict:
                 "word_limit": s.word_limit,
                 "requires_cost_analysis": bool(s.requires_cost_analysis),
                 "draft_md": s.draft_text_markdown,
+                "revision": s.current_revision_number or 0,
                 "citations": list(s.citations_json or []),
                 "needs_human": list(s.needs_human_placeholders_json or []),
                 "applied_gaps": list(s.shortfall_mitigations_applied_json or []),
@@ -318,11 +397,12 @@ def _run_preflight(
     check_fn,
     section: dict,
     proposal_id: int,
+    failures: list[str] | None = None,
 ) -> list:
-    """Run a single pre-flight check (citation, coverage, …) on one
-    section. Returns the check's findings, or [] if it raised — failures
-    are logged + staged but never propagate, so one broken check can't
-    block the rest of the review.
+    """Run one pre-flight without preventing the independent checks.
+
+    A raised check returns no findings, but its error is appended to
+    ``failures`` so the composite section attempt cannot be certified clean.
     """
     try:
         return list(check_fn(section["pk"]))
@@ -338,20 +418,25 @@ def _run_preflight(
             f"⚠ {label.capitalize()} pre-flight failed on "
             f"{section['section_id']}: "
             f"{type(exc).__name__}: {str(exc)[:140]}",
+            status="failed",
         )
+        if failures is not None:
+            failures.append(
+                f"{label} pre-flight: {type(exc).__name__}: {str(exc)[:300]}"
+            )
         return []
 
 
-def _review_one_section(
+def _execute_review_one_section(
     section: dict,
     prefix_a: str,
     prefix_b: str,
     proposal_id: int,
-) -> tuple[int, int]:
-    """Run both reviewers on one section. Returns (n_findings_a, n_findings_b).
+) -> SectionReviewResult:
+    """Run all section reviewers and return explicit completion state.
 
     Each reviewer's failure is isolated — a Reviewer A failure doesn't
-    block Reviewer B and vice versa.
+    block Reviewer B and vice versa, but either error fails the composite pass.
     """
     # Late import keeps the pre-flight services off the module-load
     # path until first use (and avoids any tightening of the import graph
@@ -366,6 +451,7 @@ def _review_one_section(
     section_pk = section["pk"]
     next_pass = get_pass_number_for_section(section_pk) + 1
     clear_unresolved_for_section(section_pk)
+    failures: list[str] = []
 
     # `applied_gaps` is a list of gap_id strings (from
     # shortfall_mitigations_applied_json on the section) — flat list.
@@ -390,43 +476,50 @@ def _review_one_section(
     n_a = 0
     preflight_findings: list = []
     preflight_findings += _run_preflight(
-        "citation",
-        check_section_citations,
-        section,
-        proposal_id,
+        "citation", check_section_citations, section, proposal_id, failures,
     )
     preflight_findings += _run_preflight(
-        "coverage",
-        check_compliance_coverage,
-        section,
-        proposal_id,
+        "coverage", check_compliance_coverage, section, proposal_id, failures,
     )
     preflight_findings += _run_preflight(
-        "grounding",
-        check_section_credentials_grounded,
-        section,
-        proposal_id,
+        "grounding", check_section_credentials_grounded, section, proposal_id,
+        failures,
     )
     preflight_findings += _run_preflight(
-        "credential allowlist",
-        check_section_credentials_allowlisted,
-        section,
-        proposal_id,
+        "credential allowlist", check_section_credentials_allowlisted,
+        section, proposal_id, failures,
     )
     if preflight_findings:
-        n_pf = persist_findings(
-            proposal_section_pk=section_pk,
-            reviewer_agent="A",
-            pass_number=next_pass,
-            findings=preflight_findings,
-        )
-        n_a += n_pf
-        log.info(
-            "pre-flight (citation + coverage + grounding + credential allowlist): "
-            "section %s -> %d finding(s)",
-            section["section_id"],
-            n_pf,
-        )
+        try:
+            n_pf = persist_findings(
+                proposal_section_pk=section_pk,
+                reviewer_agent="A",
+                pass_number=next_pass,
+                findings=preflight_findings,
+            )
+            n_a += n_pf
+            log.info(
+                "pre-flight (citation + coverage + grounding + credential allowlist): "
+                "section %s -> %d finding(s)",
+                section["section_id"], n_pf,
+            )
+        except Exception as exc:
+            log.exception(
+                "pre-flight finding persistence failed for section %s "
+                "(proposal %d)",
+                section["section_id"], proposal_id,
+            )
+            failures.append(
+                "pre-flight persistence: "
+                f"{type(exc).__name__}: {str(exc)[:300]}"
+            )
+            _set_stage(
+                proposal_id,
+                f"Pre-flight finding persistence failed on "
+                f"{section['section_id']}: {type(exc).__name__}: "
+                f"{str(exc)[:140]}",
+                status="failed",
+            )
 
     # Run Reviewer A and Reviewer B in PARALLEL. They're independent
     # passes on the same draft (different models, different concerns —
@@ -504,7 +597,13 @@ def _review_one_section(
         )
         _set_stage(
             proposal_id,
-            f"⚠ Reviewer A failed on {section['section_id']}: {type(err_a).__name__}: {str(err_a)[:140]}",
+            f"⚠ Reviewer A failed on {section['section_id']}: "
+            f"{type(err_a).__name__}: {str(err_a)[:140]}",
+            status="failed",
+        )
+
+        failures.append(
+            f"Reviewer A: {type(err_a).__name__}: {str(err_a)[:300]}"
         )
 
     n_b = 0
@@ -529,10 +628,68 @@ def _review_one_section(
         )
         _set_stage(
             proposal_id,
-            f"⚠ Reviewer B failed on {section['section_id']}: {type(err_b).__name__}: {str(err_b)[:140]}",
+            f"⚠ Reviewer B failed on {section['section_id']}: "
+            f"{type(err_b).__name__}: {str(err_b)[:140]}",
+            status="failed",
         )
 
-    return n_a, n_b
+        failures.append(
+            f"Reviewer B: {type(err_b).__name__}: {str(err_b)[:300]}"
+        )
+
+    return SectionReviewResult(n_a, n_b, tuple(failures))
+
+
+def _review_one_section(
+    section: dict,
+    prefix_a: str,
+    prefix_b: str,
+    proposal_id: int,
+) -> SectionReviewResult:
+    """Run and audit one complete section review.
+
+    The synthetic coverage row becomes COMPLETED only after every pre-flight,
+    both provider calls, and every finding write succeeds.  An incomplete
+    attempt can therefore never be interpreted as a clean section.
+    """
+    section_pk = int(section["pk"])
+    revision = int(section.get("revision") or 0)
+    marker_id = _start_review_coverage_attempt(
+        proposal_id, section_pk, revision,
+    )
+    try:
+        result = _execute_review_one_section(
+            section, prefix_a, prefix_b, proposal_id,
+        )
+    except Exception as exc:
+        _finish_review_coverage_attempt(
+            marker_id,
+            succeeded=False,
+            error_text=f"{type(exc).__name__}: {str(exc)}",
+        )
+        raise
+
+    try:
+        _finish_review_coverage_attempt(
+            marker_id,
+            succeeded=result.succeeded,
+            error_text="; ".join(result.failures),
+        )
+    except Exception as exc:
+        log.exception(
+            "failed to finalize review coverage for section %s "
+            "(proposal %d)",
+            section.get("section_id", section_pk), proposal_id,
+        )
+        return SectionReviewResult(
+            result.n_findings_a,
+            result.n_findings_b,
+            result.failures + (
+                "review coverage persistence: "
+                f"{type(exc).__name__}: {str(exc)[:300]}",
+            ),
+        )
+    return result
 
 
 def run_reviewer_loop(proposal_id: int) -> None:
@@ -541,6 +698,7 @@ def run_reviewer_loop(proposal_id: int) -> None:
     Status flow: DRAFT_READY → REVIEWING → DRAFT_READY (with findings now
     populated). User reviews the findings and decides what to do.
     """
+    require_proposal_mutable(proposal_id, operation="run proposal review")
     log.info("reviewer loop starting for proposal %d", proposal_id)
     try:
         with session_scope() as db:
@@ -556,6 +714,7 @@ def run_reviewer_loop(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 "No drafted sections to review. Run Writer Team first.",
+                status="failed",
             )
             with session_scope() as db:
                 p = db.get(Proposal, proposal_id)
@@ -567,14 +726,19 @@ def run_reviewer_loop(proposal_id: int) -> None:
 
         n_total = len(eligible)
         total_findings = 0
+        failed_sections: list[str] = []
         for idx, section in enumerate(eligible, 1):
             _set_stage(
                 proposal_id,
                 f"Reviewing section {idx}/{n_total}: {section['section_id']} "
                 f"{section['section_title']} (Opus + Gemini)…",
             )
-            n_a, n_b = _review_one_section(section, prefix_a, prefix_b, proposal_id)
-            total_findings += n_a + n_b
+            result = _review_one_section(
+                section, prefix_a, prefix_b, proposal_id,
+            )
+            total_findings += result.n_findings_a + result.n_findings_b
+            if not result.succeeded:
+                failed_sections.append(section["section_id"])
 
         # Auto-accept pending findings per the configured severity
         # floor. Default config (floor=None) accepts everything so the
@@ -614,15 +778,31 @@ def run_reviewer_loop(proposal_id: int) -> None:
             if p:
                 p.status = ProposalStatus.DRAFT_READY
 
-        _set_stage(
-            proposal_id,
-            f"Review complete: {total_findings} finding(s) across {n_total} "
-            f"section(s){accept_summary}. Open the Findings tab to act on them.",
-        )
+        if failed_sections:
+            _set_stage(
+                proposal_id,
+                f"Review incomplete: {len(failed_sections)}/{n_total} "
+                f"section(s) had a reviewer, pre-flight, or persistence "
+                f"failure ({', '.join(failed_sections)}). "
+                f"{total_findings} finding(s) from completed components were "
+                f"preserved{accept_summary}. Re-run Reviewer Findings before "
+                f"approval.",
+                status="failed",
+            )
+        else:
+            _set_stage(
+                proposal_id,
+                f"Review complete: {total_findings} finding(s) across {n_total} "
+                f"section(s){accept_summary}. Open the Findings tab to act on them.",
+            )
 
     except Exception:
         log.exception("reviewer loop failed for proposal %d", proposal_id)
-        _set_stage(proposal_id, "Reviewer loop failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Reviewer loop failed — check logs.",
+            status="failed",
+        )
         with session_scope() as db:
             p = db.get(Proposal, proposal_id)
             if p and p.status == ProposalStatus.REVIEWING:
@@ -632,6 +812,9 @@ def run_reviewer_loop(proposal_id: int) -> None:
 def run_reviewer_for_section(proposal_id: int, proposal_section_pk: int) -> None:
     """Re-run Reviewer A + B on ONE section. Used after the user applies
     accepted findings to verify the issues were addressed."""
+    require_proposal_mutable(
+        proposal_id, operation="review proposal section",
+    )
     log.info(
         "reviewer re-run for section pk=%d (proposal %d)",
         proposal_section_pk,
@@ -647,6 +830,7 @@ def run_reviewer_for_section(proposal_id: int, proposal_section_pk: int) -> None
             _set_stage(
                 proposal_id,
                 f"Section pk={proposal_section_pk} not found or not yet drafted.",
+                status="failed",
             )
             return
         if section.get("requires_cost_analysis"):
@@ -661,7 +845,11 @@ def run_reviewer_for_section(proposal_id: int, proposal_section_pk: int) -> None
             f"Re-reviewing section {section['section_id']} {section['section_title']}…",
         )
         prefix_a, prefix_b = _build_prefixes(proposal_id, snap)
-        n_a, n_b = _review_one_section(section, prefix_a, prefix_b, proposal_id)
+        result = _review_one_section(
+            section, prefix_a, prefix_b, proposal_id,
+        )
+        n_a = result.n_findings_a
+        n_b = result.n_findings_b
 
         # Same auto-accept policy as the loop variant — keep behavior
         # identical so the user gets the same triaged-up-front view
@@ -683,18 +871,30 @@ def run_reviewer_for_section(proposal_id: int, proposal_section_pk: int) -> None
                 "auto-accept after section re-review failed (non-fatal)",
             )
 
-        _set_stage(
-            proposal_id,
-            f"Section {section['section_id']} re-reviewed: "
-            f"{n_a} A-finding(s), {n_b} B-finding(s){accept_summary}.",
-        )
+        if result.succeeded:
+            _set_stage(
+                proposal_id,
+                f"Section {section['section_id']} re-reviewed: "
+                f"{n_a} A-finding(s), {n_b} B-finding(s){accept_summary}.",
+            )
+        else:
+            _set_stage(
+                proposal_id,
+                f"Section {section['section_id']} review incomplete: "
+                f"{'; '.join(result.failures)}. Re-run before approval.",
+                status="failed",
+            )
 
     except Exception:
         log.exception(
             "reviewer re-run failed for section pk=%d",
             proposal_section_pk,
         )
-        _set_stage(proposal_id, "Section re-review failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Section re-review failed — check logs.",
+            status="failed",
+        )
 
 
 def spawn_reviewer_loop(proposal_id: int) -> threading.Thread:
@@ -783,6 +983,7 @@ def _refresh_section_snapshot(proposal_id: int, section_pk: int) -> dict | None:
             "word_limit": s.word_limit,
             "requires_cost_analysis": bool(s.requires_cost_analysis),
             "draft_md": s.draft_text_markdown,
+            "revision": s.current_revision_number or 0,
             "citations": list(s.citations_json or []),
             "needs_human": list(s.needs_human_placeholders_json or []),
             "applied_gaps": list(s.shortfall_mitigations_applied_json or []),
@@ -810,6 +1011,9 @@ def _process_one_section(
       "cancelled"      — cancel_event was set; exited at a checkpoint
       "cost_deferred"  — section was flagged cost-deferred mid-loop
       "no_draft"       — section lost its draft (regenerate failed?)
+      "review_failed"  — a reviewer, pre-flight, or finding write failed
+      "revision_failed" — writer could not produce a replacement draft
+      "section_busy"   — another worker owns the section; skipped fail-closed
 
     Worker-safe: each call uses its own session_scope + its own LLM
     sessions. The shared mutable state is the cancel_event (thread-safe
@@ -826,7 +1030,16 @@ def _process_one_section(
     # Mark in-flight so the UI can render an indicator on this section
     # and the Apply-accepted-findings safety check refuses concurrent
     # writer regenerates.
-    add_active_section(proposal_id, section_pk)
+    acquired = add_active_section(proposal_id, section_pk)
+    if not acquired:
+        _set_stage(
+            proposal_id,
+            f"[{section_idx}/{n_total}] {section_label} — skipped because "
+            "another writer or polish worker is already changing it. Re-run "
+            "Reviewer Findings after that work completes.",
+            status="failed",
+        )
+        return "section_busy"
     try:
         prev_n_to_revise: int | None = None
         consecutive_no_progress = 0
@@ -855,7 +1068,19 @@ def _process_one_section(
                 proposal_id,
                 f"[{section_idx}/{n_total}] {section_label} — pass {pass_num}/{max_passes}: reviewing…",
             )
-            _review_one_section(latest, prefix_a, prefix_b, proposal_id)
+            review_result = _review_one_section(
+                latest, prefix_a, prefix_b, proposal_id,
+            )
+            if not review_result.succeeded:
+                _set_stage(
+                    proposal_id,
+                    f"[{section_idx}/{n_total}] {section_label} — "
+                    f"pass {pass_num}: review incomplete; "
+                    f"{'; '.join(review_result.failures)}. "
+                    f"Re-run before approval.",
+                    status="failed",
+                )
+                return "review_failed"
 
             if cancel_event.is_set():
                 return "cancelled"
@@ -926,12 +1151,20 @@ def _process_one_section(
                 f"pass {pass_num}: writer applying "
                 f"{len(to_revise)} fix(es){escalation_tag}…",
             )
-            run_writer_for_section(
-                proposal_id,
-                section_pk,
+            regenerated = run_writer_for_section(
+                proposal_id, section_pk,
                 user_directive=directive,
                 pass_num=pass_num,
             )
+            if not regenerated:
+                _set_stage(
+                    proposal_id,
+                    f"[{section_idx}/{n_total}] {section_label} — "
+                    f"pass {pass_num}: writer regeneration failed; "
+                    f"findings remain unresolved.",
+                    status="failed",
+                )
+                return "revision_failed"
             mark_findings_resolved(
                 [f["id"] for f in to_revise],
                 pass_num,
@@ -1057,6 +1290,9 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
     - cancelled — cancel_event set mid-loop
     - cost_deferred — section was toggled cost-deferred mid-loop
     - no_draft — section lost its draft (rare; surface for inspection)
+    - review_failed — reviewer/pre-flight/finding persistence was incomplete
+    - revision_failed — writer could not produce a replacement draft
+    - section_busy — another worker owned the section, so review was skipped
 
     Status flow: DRAFT_READY → REVIEWING → DRAFT_READY (with any remaining
     findings populated). The user decides what to do next.
@@ -1067,6 +1303,9 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
     exit within ~30-90s of the cancel signal (bounded by the longest
     in-flight LLM call).
     """
+    require_proposal_mutable(
+        proposal_id, operation="run auto review-revise loop",
+    )
     settings = get_settings()
     workers = max(1, int(settings.auto_loop_workers or 1))
     log.info(
@@ -1088,6 +1327,7 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
             "Auto loop refused to start: another auto-review loop is "
             "already running for this proposal. Cancel the running one "
             "first, or restart the app (Ctrl+C in terminal) to clear it.",
+            status="failed",
         )
         return
 
@@ -1101,7 +1341,11 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
         snap = _snapshot_review_inputs(proposal_id)
         eligible = [s for s in snap["sections"] if s.get("draft_md") and not s.get("requires_cost_analysis")]
         if not eligible:
-            _set_stage(proposal_id, "No drafted sections to review.")
+            _set_stage(
+                proposal_id,
+                "No drafted sections to review.",
+                status="failed",
+            )
             with session_scope() as db:
                 p = db.get(Proposal, proposal_id)
                 if p:
@@ -1114,6 +1358,10 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
         n_clean = 0
         n_capped = 0
         n_stuck = 0
+        n_review_failed = 0
+        n_revision_failed = 0
+        n_worker_failed = 0
+        n_section_busy = 0
 
         _set_stage(
             proposal_id,
@@ -1147,6 +1395,7 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
                 try:
                     result = future.result()
                 except Exception:
+                    n_worker_failed += 1
                     log.exception(
                         "auto-loop worker failed for section %s (proposal %d)",
                         section.get("section_id"),
@@ -1154,7 +1403,9 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
                     )
                     _set_stage(
                         proposal_id,
-                        f"⚠ Worker for {section.get('section_id', '?')} raised an exception — see logs.",
+                        f"⚠ Worker for {section.get('section_id', '?')} "
+                        f"raised an exception — see logs.",
+                        status="failed",
                     )
                     continue
 
@@ -1166,8 +1417,19 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
                     n_stuck += 1
                 elif result == "cancelled":
                     cancelled = True
+                elif result == "review_failed":
+                    n_review_failed += 1
+                elif result == "revision_failed":
+                    n_revision_failed += 1
+                elif result == "section_busy":
+                    n_section_busy += 1
                 # cost_deferred / no_draft: don't bump any tally; they're
                 # surfaced via stage messages already.
+
+        # A cancel can arrive in the narrow window after the last worker
+        # returns but before the consistency pass starts. Worker outcomes alone
+        # would miss that signal and launch one more costly provider call.
+        cancelled = cancelled or cancel_event.is_set()
 
         # Cross-section consistency pass — runs once after the per-section
         # workers all finish (whether converged, capped, or stuck). Catches
@@ -1175,7 +1437,7 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
         # numbers for the same thing across sections, conflicting names,
         # etc.). Best-effort; a failure here doesn't roll back the loop.
         consistency_error: str | None = None
-        if not cancelled:
+        if not cancelled and not n_section_busy:
             try:
                 _run_consistency_pass(proposal_id)
             except Exception as exc:
@@ -1184,6 +1446,10 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
                     proposal_id,
                 )
                 consistency_error = str(exc) or type(exc).__name__
+
+        # Synchronous provider calls cannot be interrupted mid-call. If cancel
+        # arrived during consistency, still honor it for terminal status.
+        cancelled = cancelled or cancel_event.is_set()
 
         with session_scope() as db:
             p = db.get(Proposal, proposal_id)
@@ -1194,8 +1460,13 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
             _set_stage(
                 proposal_id,
                 f"🛑 Auto review-revise CANCELLED by user. "
-                f"{n_clean} clean, {n_stuck} stuck, {n_capped} capped before stop. "
+                f"{n_clean} clean, {n_stuck} stuck, {n_capped} capped, "
+                f"{n_review_failed} review failures, "
+                f"{n_revision_failed} writer failures, "
+                f"{n_section_busy} busy-section skips, "
+                f"{n_worker_failed} worker failures before stop. "
                 f"Open the Findings tab to see what was completed.",
+                status="cancelled",
             )
         else:
             parts = [f"Auto review-revise complete: {n_clean}/{n_total} fully clean"]
@@ -1203,8 +1474,30 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
                 parts.append(f"{n_stuck} stuck")
             if n_capped:
                 parts.append(f"{n_capped} hit pass cap")
-            if n_stuck or n_capped:
-                parts.append("Open the Findings tab — un-resolvable issues need human review.")
+            if n_review_failed:
+                parts.append(f"{n_review_failed} incomplete section review(s)")
+            if n_revision_failed:
+                parts.append(
+                    f"{n_revision_failed} writer regeneration(s) failed"
+                )
+            if n_worker_failed:
+                parts.append(f"{n_worker_failed} worker(s) failed")
+            if n_section_busy:
+                parts.append(
+                    f"{n_section_busy} section(s) skipped because another "
+                    "worker owned them"
+                )
+            if (
+                n_stuck
+                or n_capped
+                or n_review_failed
+                or n_revision_failed
+                or n_worker_failed
+                or n_section_busy
+            ):
+                parts.append(
+                    "Open the Findings tab — un-resolvable issues need human review."
+                )
             else:
                 parts.append("All sections converged with zero findings.")
             if consistency_error:
@@ -1213,24 +1506,42 @@ def run_auto_review_revise_loop(proposal_id: int, max_passes: int = _DEFAULT_MAX
                     "findings are reliable, but inter-section conflicts "
                     "were not verified this run. See log for details."
                 )
-            _set_stage(proposal_id, " · ".join(parts))
+            _set_stage(
+                proposal_id,
+                " · ".join(parts),
+                status=(
+                    "failed"
+                    if (
+                        n_revision_failed
+                        or n_review_failed
+                        or n_worker_failed
+                        or n_section_busy
+                        or consistency_error
+                    )
+                    else "completed"
+                ),
+            )
 
     except Exception:
         log.exception(
             "auto review-revise loop failed for proposal %d",
             proposal_id,
         )
-        _set_stage(proposal_id, "Auto review-revise loop failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Auto review-revise loop failed — check logs.",
+            status="failed",
+        )
         with session_scope() as db:
             p = db.get(Proposal, proposal_id)
             if p and p.status == ProposalStatus.REVIEWING:
                 p.status = ProposalStatus.DRAFT_READY
     finally:
-        # Drop any leftover in-flight markers — workers normally do this
-        # via their finally blocks, but a hard exception in the executor
-        # context could leave entries stale. Belt-and-suspenders.
-        clear_active_sections(proposal_id)
-        unregister_cancel(JOB_AUTO_REVIEW, proposal_id)
+        # Each worker owns and removes its section marker in
+        # _process_one_section's finally block. Do not blanket-clear the
+        # proposal here: a manual writer/final-polish worker may legitimately
+        # be active for the same proposal.
+        unregister_cancel(JOB_AUTO_REVIEW, proposal_id, cancel_event)
 
 
 def spawn_auto_review_revise_loop(

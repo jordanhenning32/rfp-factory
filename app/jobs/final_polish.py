@@ -34,6 +34,7 @@ from app.services.cancellation import (
     remove_active_section,
 )
 from app.services.polish import record_polish_edit
+from app.services.proposal_access import require_proposal_mutable
 from app.services.sections import persist_section_draft
 from app.services.stages import record_stage as _set_stage
 
@@ -95,6 +96,24 @@ def _snapshot_sections(proposal_id: int) -> list[dict]:
         ]
 
 
+def _refresh_polish_section(proposal_id: int, section_pk: int) -> dict | None:
+    """Read the current persistence inputs after section ownership is held."""
+    with session_scope() as db:
+        section = db.get(ProposalSection, section_pk)
+        if section is None or section.proposal_id != proposal_id:
+            return None
+        return {
+            "draft_md": section.draft_text_markdown or "",
+            "citations": list(section.citations_json or []),
+            "needs_human_placeholders": list(
+                section.needs_human_placeholders_json or [],
+            ),
+            "shortfall_mitigations_applied": list(
+                section.shortfall_mitigations_applied_json or [],
+            ),
+        }
+
+
 def run_final_polish(proposal_id: int) -> None:
     """Orchestrate the full polish pass:
       1. Snapshot every drafted section.
@@ -109,6 +128,7 @@ def run_final_polish(proposal_id: int) -> None:
     Best-effort. Per-issue failures are logged and skipped — they
     don't abort the rest of the pass.
     """
+    require_proposal_mutable(proposal_id, operation="run final polish")
     log.info("final polish starting for proposal %d", proposal_id)
     # Single timestamp shared by every edit applied in THIS pass —
     # the UI groups edits by `applied_in_run_at` to render
@@ -132,6 +152,7 @@ def run_final_polish(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 "Final Polish: no drafted sections — nothing to polish.",
+                status="failed",
             )
             return
 
@@ -162,6 +183,7 @@ def run_final_polish(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 "Final Polish failed at detection step — check logs.",
+                status="failed",
             )
             return
 
@@ -206,6 +228,7 @@ def run_final_polish(proposal_id: int) -> None:
         n_section_not_found = 0
         n_apply_failed = 0
         n_text_not_in_draft = 0
+        n_section_busy = 0
         applied_summaries: list[str] = []
 
         for issue in issues:
@@ -221,11 +244,33 @@ def run_final_polish(proposal_id: int) -> None:
                 continue
 
             section_pk = target["pk"]
-            current_md = target["draft_md"]
             # Mark in-flight so concurrent regenerate paths don't race
             # us. Per-issue grain — releases between issues so a long
             # polish pass doesn't lock the whole section.
-            add_active_section(proposal_id, section_pk)
+            if not add_active_section(proposal_id, section_pk):
+                n_section_busy += 1
+                log.info(
+                    "final_polish: section %s is owned by another worker; "
+                    "skipping issue=%s",
+                    issue.section_id,
+                    issue.issue_type,
+                )
+                continue
+
+            # A writer could have completed after detector snapshotting but
+            # before this lease was acquired. Re-read under ownership so the
+            # applier never starts from that stale snapshot.
+            try:
+                current = _refresh_polish_section(proposal_id, section_pk)
+            except Exception:
+                remove_active_section(proposal_id, section_pk)
+                raise
+            if current is None or not current["draft_md"].strip():
+                n_text_not_in_draft += 1
+                remove_active_section(proposal_id, section_pk)
+                continue
+            current_md = current["draft_md"]
+            target.update(current)
             try:
                 result = apply_polish_issue(
                     proposal_id=proposal_id,
@@ -328,16 +373,21 @@ def run_final_polish(proposal_id: int) -> None:
             msg_parts.append(f"{n_section_not_found} skipped (unknown section_id from detector)")
         if n_apply_failed:
             msg_parts.append(f"{n_apply_failed} failed")
-        _set_stage(proposal_id, " · ".join(msg_parts) + ".")
+        if n_section_busy:
+            msg_parts.append(
+                f"{n_section_busy} skipped (section owned by another worker)"
+            )
+        _set_stage(
+            proposal_id,
+            " · ".join(msg_parts) + ".",
+            status="failed" if (n_apply_failed or n_section_busy) else "completed",
+        )
 
         log.info(
             "final_polish: proposal %d — %d applied, %d skipped "
-            "(text gone), %d skipped (no section), %d failed",
-            proposal_id,
-            n_applied,
-            n_text_not_in_draft,
-            n_section_not_found,
-            n_apply_failed,
+            "(text gone), %d skipped (no section), %d busy, %d failed",
+            proposal_id, n_applied, n_text_not_in_draft,
+            n_section_not_found, n_section_busy, n_apply_failed,
         )
         if applied_summaries:
             log.info(
@@ -347,7 +397,11 @@ def run_final_polish(proposal_id: int) -> None:
 
     except Exception:
         log.exception("final polish failed for proposal %d", proposal_id)
-        _set_stage(proposal_id, "Final Polish failed — check logs.")
+        _set_stage(
+            proposal_id,
+            "Final Polish failed — check logs.",
+            status="failed",
+        )
 
 
 def spawn_final_polish(proposal_id: int) -> threading.Thread:

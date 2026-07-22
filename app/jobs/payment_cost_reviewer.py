@@ -30,6 +30,9 @@ from app.agents.payment_cost_reviewer import (
 )
 from app.db.session import session_scope
 from app.models import Proposal, ProposalSection
+from app.services.payment_cost_review import persist_payment_cost_review_data
+from app.services.proposal_access import require_proposal_mutable
+from app.services.review_freshness import build_payment_review_provenance
 from app.services.service_line import (
     SERVICE_LINE_PAYMENT_SYSTEMS,
     get_service_line,
@@ -56,6 +59,9 @@ def spawn_payment_cost_reviewer(proposal_id: int) -> None:
 def run_payment_cost_reviewer(proposal_id: int) -> None:
     """Sync entry point. Builds inputs, runs the agent, persists.
     All exceptions surface via the stage banner."""
+    require_proposal_mutable(
+        proposal_id, operation="run payment cost review",
+    )
     log.info(
         "payment_cost_reviewer starting for proposal %d",
         proposal_id,
@@ -72,11 +78,27 @@ def run_payment_cost_reviewer(proposal_id: int) -> None:
             proposal_id,
             "Payment Cost Reviewer: loading drafted section(s) + scan + pricing data…",
         )
+        provenance_before = build_payment_review_provenance(proposal_id)
         inputs = _snapshot_inputs(proposal_id)
         if inputs is None:
             _set_stage(
                 proposal_id,
                 f"Payment Cost Reviewer: proposal {proposal_id} not found.",
+                status="failed",
+            )
+            return
+        reviewed_provenance = build_payment_review_provenance(proposal_id)
+        if (
+            provenance_before is None
+            or reviewed_provenance is None
+            or provenance_before != reviewed_provenance
+        ):
+            _set_stage(
+                proposal_id,
+                "Payment Cost Reviewer: inputs changed while they were "
+                "being snapshotted. No review was saved; rerun Payment "
+                "Cost Reviewer.",
+                status="failed",
             )
             return
         if not inputs.sections:
@@ -84,6 +106,7 @@ def run_payment_cost_reviewer(proposal_id: int) -> None:
                 proposal_id,
                 "Payment Cost Reviewer: no cost-deferred sections "
                 "drafted yet — run Cost Volume Writer first.",
+                status="failed",
             )
             return
 
@@ -99,7 +122,19 @@ def run_payment_cost_reviewer(proposal_id: int) -> None:
             inputs=inputs,
         )
 
-        _persist_result(proposal_id, result)
+        if not _persist_result(
+            proposal_id,
+            result,
+            reviewed_provenance=reviewed_provenance,
+        ):
+            _set_stage(
+                proposal_id,
+                "Payment Cost Reviewer: scan, pricing, or narrative changed "
+                "while the review was running. The stale result was "
+                "discarded; rerun Payment Cost Reviewer.",
+                status="failed",
+            )
+            return
 
         n_findings = len(result.findings)
         n_critical = sum(1 for f in result.findings if f.severity == "CRITICAL")
@@ -128,6 +163,7 @@ def run_payment_cost_reviewer(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             f"Payment Cost Reviewer: failed — {exc}",
+            status="failed",
         )
 
 
@@ -190,16 +226,20 @@ def _snapshot_inputs(proposal_id: int) -> PaymentCostReviewInputs | None:
 # ---- Persistence --------------------------------------------------------
 
 
-def _persist_result(proposal_id: int, result) -> None:
+def _persist_result(
+    proposal_id: int,
+    result,
+    *,
+    reviewed_provenance: dict[str, str] | None = None,
+) -> bool:
     """Serialize the result and write to proposals.payment_cost_
-    review_findings_json. Replaces any prior review in full — re-
-    running overwrites rather than appends."""
-    payload = json.dumps(result.to_json_dict(), indent=2, default=str)
-    with session_scope() as db:
-        p = db.get(Proposal, proposal_id)
-        if p is None:
-            return
-        p.payment_cost_review_findings_json = payload
+    review_findings_json. Stale findings are replaced while matching
+    findings retain their prior user action and note."""
+    return persist_payment_cost_review_data(
+        proposal_id,
+        result.to_json_dict(),
+        reviewed_provenance=reviewed_provenance,
+    )
 
 
 __all__ = [

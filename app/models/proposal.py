@@ -11,6 +11,7 @@ from app.db.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
     from app.models.compliance import ComplianceMatrixItem, GapAnalysis
+    from app.models.cost_matrix import CostMatrixArtifact
     from app.models.pricing import PricingPackage
     from app.models.proposal_outcome import ProposalOutcome
     from app.models.section import ProposalSection
@@ -67,6 +68,13 @@ class RfpPackageDocument(Base, TimestampMixin):
     sequence_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     rfp_package: Mapped[RfpPackage] = relationship(back_populates="documents")
+    cost_matrix_artifact: Mapped[CostMatrixArtifact | None] = relationship(
+        back_populates="source_document",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        single_parent=True,
+    )
 
 
 class Proposal(Base, TimestampMixin):
@@ -232,6 +240,14 @@ class Proposal(Base, TimestampMixin):
     # button when this column is NULL. Migration 0032 added the column.
     evaluation_criteria_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Deterministic win-strategy workspace artifacts (migration 0035).
+    evaluator_scorecard_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    win_themes_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    past_performance_matches_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price_to_win_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    red_team_findings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graphics_tables_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     rfp_package: Mapped[RfpPackage] = relationship(back_populates="proposal")
     compliance_items: Mapped[list[ComplianceMatrixItem]] = relationship(
         back_populates="proposal",
@@ -246,6 +262,10 @@ class Proposal(Base, TimestampMixin):
         cascade="all, delete-orphan",
     )
     pricing_packages: Mapped[list[PricingPackage]] = relationship(
+        back_populates="proposal",
+        cascade="all, delete-orphan",
+    )
+    cost_matrices: Mapped[list[CostMatrixArtifact]] = relationship(
         back_populates="proposal",
         cascade="all, delete-orphan",
     )

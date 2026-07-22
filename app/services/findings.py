@@ -14,9 +14,18 @@ from sqlalchemy import select
 
 from app.core.enums import FindingCategory, FindingSeverity, ReviewerAgent
 from app.db.session import session_scope
-from app.models import ReviewerFinding
+from app.models import ProposalSection, ReviewerFinding
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
+
+
+def _ensure_section_mutable(db, proposal_section_pk: int, operation: str) -> None:
+    section = db.get(ProposalSection, proposal_section_pk)
+    if section is not None:
+        ensure_proposal_mutable(
+            db, section.proposal_id, operation=operation,
+        )
 
 
 def persist_findings(
@@ -29,6 +38,9 @@ def persist_findings(
     """Insert reviewer_findings rows and return the count written."""
     written = 0
     with session_scope() as db:
+        _ensure_section_mutable(
+            db, proposal_section_pk, "persist reviewer findings",
+        )
         for f in findings:
             try:
                 sev = FindingSeverity(f.severity)
@@ -74,16 +86,15 @@ def clear_unresolved_for_section(proposal_section_pk: int) -> int:
       silently drop the user's intent.
     """
     with session_scope() as db:
-        result = (
-            db.query(ReviewerFinding)
-            .filter(
-                ReviewerFinding.proposal_section_id == proposal_section_pk,
-                ReviewerFinding.resolved_in_pass_number.is_(None),
-                ReviewerFinding.dismissed_at.is_(None),
-                ReviewerFinding.accepted_at.is_(None),
-            )
-            .delete(synchronize_session=False)
+        _ensure_section_mutable(
+            db, proposal_section_pk, "clear reviewer findings",
         )
+        result = db.query(ReviewerFinding).filter(
+            ReviewerFinding.proposal_section_id == proposal_section_pk,
+            ReviewerFinding.resolved_in_pass_number.is_(None),
+            ReviewerFinding.dismissed_at.is_(None),
+            ReviewerFinding.accepted_at.is_(None),
+        ).delete(synchronize_session=False)
     return int(result or 0)
 
 
@@ -105,6 +116,9 @@ def accept_finding(finding_id: int) -> bool:
         f = db.get(ReviewerFinding, finding_id)
         if f is None:
             return False
+        _ensure_section_mutable(
+            db, f.proposal_section_id, "accept reviewer finding",
+        )
         f.accepted_at = datetime.utcnow()
         f.dismissed_at = None
         f.dismissed_reason = None
@@ -149,8 +163,9 @@ def bulk_accept_pending_findings(
     }
     now = datetime.utcnow()
     with session_scope() as db:
-        from app.models import ProposalSection
-
+        ensure_proposal_mutable(
+            db, proposal_id, operation="accept reviewer findings",
+        )
         sec_pks = [
             r[0]
             for r in db.execute(
@@ -199,6 +214,9 @@ def dismiss_finding(finding_id: int, reason: str | None = None) -> bool:
         f = db.get(ReviewerFinding, finding_id)
         if f is None:
             return False
+        _ensure_section_mutable(
+            db, f.proposal_section_id, "dismiss reviewer finding",
+        )
         f.dismissed_at = datetime.utcnow()
         f.dismissed_reason = (reason or "").strip() or None
         f.accepted_at = None
@@ -211,6 +229,9 @@ def unmark_finding(finding_id: int) -> bool:
         f = db.get(ReviewerFinding, finding_id)
         if f is None:
             return False
+        _ensure_section_mutable(
+            db, f.proposal_section_id, "reset reviewer finding",
+        )
         f.accepted_at = None
         f.dismissed_at = None
         f.dismissed_reason = None
@@ -254,6 +275,20 @@ def mark_findings_resolved(finding_ids: list[int], pass_number: int) -> int:
     if not finding_ids:
         return 0
     with session_scope() as db:
+        proposal_ids = set(
+            db.execute(
+                select(ProposalSection.proposal_id)
+                .join(
+                    ReviewerFinding,
+                    ReviewerFinding.proposal_section_id == ProposalSection.id,
+                )
+                .where(ReviewerFinding.id.in_(finding_ids))
+            ).scalars().all()
+        )
+        for proposal_id in proposal_ids:
+            ensure_proposal_mutable(
+                db, proposal_id, operation="resolve reviewer findings",
+            )
         result = (
             db.query(ReviewerFinding)
             .filter(

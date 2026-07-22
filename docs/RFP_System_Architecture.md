@@ -514,7 +514,7 @@ Most of the spend is in the auto-loop. Skip it for time-pressured runs and rely 
 
 - **One-click "Build Full Proposal" macro.** Chains Cost Analyst → Cost Reviewer → Strategy → Apply Strategy → Writer Team → Reviewer A+B → Cost Volume Writer with optional pause checkpoints.
 - **Profile auto-extraction from new resumes.** Sonnet parses uploaded resume, proposes a `key_personnel` entry. Closes the gap where KB-only people show in the Team-tab dropdown but autofill is empty.
-- **Pattern-memory rejection rules.** Learn from history that the user always rejects "verify NC E-Procurement registration"-style patterns; auto-tag dismiss-likely findings on next pass.
+- **Pattern-memory rejection rules.** Learn from history that the user rejects "verify buyer-portal registration"-style patterns; auto-tag dismiss-likely findings on next pass.
 - **Stream compliance matrix output.** Perceived latency improvement, no wall-clock change.
 - **Async/best-effort validator pass.** Runs in background after persistence; doesn't block.
 - **References appendix in DOCX.** Pull `citations_json` per section, render as numbered footnote list at end of proposal (not the Submission Checklist appendix — separate).

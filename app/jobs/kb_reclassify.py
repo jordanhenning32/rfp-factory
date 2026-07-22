@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import UTC
 
 from app.agents.kb_classify import classify_text
 from app.agents.kb_facts import extract_profile_suggestions
@@ -58,36 +59,31 @@ def reclassify_all_documents() -> dict:
     from datetime import datetime
 
     _PROGRESS.update(
-        running=True,
-        total=0,
-        done=0,
-        skipped=0,
-        updated=0,
-        started_at=datetime.utcnow(),
-        completed_at=None,
+        running=True, total=0, done=0, skipped=0, updated=0,
+        started_at=datetime.now(UTC), completed_at=None,
     )
 
-    with session_scope() as db:
-        doc_ids = [d.id for d in db.query(KnowledgeBaseDocument).all()]
-    _PROGRESS["total"] = len(doc_ids)
+    try:
+        with session_scope() as db:
+            doc_ids = [d.id for d in db.query(KnowledgeBaseDocument).all()]
+        _PROGRESS["total"] = len(doc_ids)
 
-    for doc_id in doc_ids:
-        try:
-            _reclassify_one(doc_id)
-            _PROGRESS["updated"] += 1
-        except Exception:
-            log.exception("reclassify failed for doc %d", doc_id)
-            _PROGRESS["skipped"] += 1
-        _PROGRESS["done"] += 1
+        for doc_id in doc_ids:
+            try:
+                _reclassify_one(doc_id)
+                _PROGRESS["updated"] += 1
+            except Exception:
+                log.exception("reclassify failed for doc %d", doc_id)
+                _PROGRESS["skipped"] += 1
+            _PROGRESS["done"] += 1
 
-    _PROGRESS["running"] = False
-    _PROGRESS["completed_at"] = datetime.utcnow()
-    log.info(
-        "reclassify_all_documents done: %d total, %d updated, %d skipped",
-        _PROGRESS["total"],
-        _PROGRESS["updated"],
-        _PROGRESS["skipped"],
-    )
+        log.info(
+            "reclassify_all_documents done: %d total, %d updated, %d skipped",
+            _PROGRESS["total"], _PROGRESS["updated"], _PROGRESS["skipped"],
+        )
+    finally:
+        _PROGRESS["running"] = False
+        _PROGRESS["completed_at"] = datetime.now(UTC)
     return dict(_PROGRESS)
 
 

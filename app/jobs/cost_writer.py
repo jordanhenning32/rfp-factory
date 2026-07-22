@@ -7,8 +7,8 @@ Two entry points:
 
 Loops over every ProposalSection where requires_cost_analysis=True
 AND excluded_from_draft=False, drafts each one in parallel via the
-existing writer_workers pool size. Re-running replaces existing
-drafts (clear_section_draft → draft → persist_section_draft).
+existing writer_workers pool size. Re-running replaces an existing
+draft only after the agent produces a complete replacement.
 
 Prerequisites surfaced as stage banners:
   - Pricing packages must exist (Cost Analyst must have run first).
@@ -38,16 +38,15 @@ from app.models import (
     Proposal,
     ProposalSection,
 )
+from app.services.cancellation import add_active_section, remove_active_section
 from app.services.market_scan import get_market_scan_snapshot
 from app.services.pricing import (
     format_cost_build_block_for_writer,
     get_pricing_packages_snapshot,
     get_proposed_scenario,
 )
-from app.services.sections import (
-    clear_section_draft,
-    persist_section_draft,
-)
+from app.services.proposal_access import require_proposal_mutable
+from app.services.sections import persist_section_draft
 from app.services.service_line import (
     SERVICE_LINE_IT_SERVICES,
     SERVICE_LINE_PAYMENT_SYSTEMS,
@@ -274,6 +273,7 @@ def _compliance_text_for_section(
 def run_cost_writer(proposal_id: int) -> None:
     """Sync entry point. Drafts every cost-deferred section in
     parallel, persisting via the existing Writer Team's path."""
+    require_proposal_mutable(proposal_id, operation="run cost writer")
     log.info("cost writer starting for proposal %d", proposal_id)
     try:
         _set_stage(
@@ -285,6 +285,7 @@ def run_cost_writer(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 f"Cost Volume Writer: proposal {proposal_id} not found.",
+                status="failed",
             )
             return
         if not inputs["sections"]:
@@ -310,6 +311,7 @@ def run_cost_writer(proposal_id: int) -> None:
                     "Cost Volume Writer: payment_systems data files "
                     "missing or empty (data/pricing/payment_systems.json"
                     " + _payment_systems_context.json). Cannot proceed.",
+                    status="failed",
                 )
                 return
             # Pull accepted Cost Reviewer findings from the prior pass
@@ -354,6 +356,7 @@ def run_cost_writer(proposal_id: int) -> None:
                     f"Cost Volume Writer: only {len(pricing_packages)} "
                     f"pricing package(s) found; need 3 (LOW/MEDIUM/HIGH). "
                     f"Run Cost Analyst first.",
+                    status="failed",
                 )
                 return
 
@@ -368,7 +371,9 @@ def run_cost_writer(proposal_id: int) -> None:
             if proposed_pkg is None:
                 _set_stage(
                     proposal_id,
-                    f"Cost Volume Writer: missing {proposed_scenario} scenario; cannot proceed.",
+                    f"Cost Volume Writer: missing {proposed_scenario} "
+                    f"scenario; cannot proceed.",
+                    status="failed",
                 )
                 return
 
@@ -408,6 +413,7 @@ def run_cost_writer(proposal_id: int) -> None:
 
         n_done = 0
         n_failed = 0
+        n_section_busy = 0
         with ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="cost-writer",
@@ -430,7 +436,16 @@ def run_cost_writer(proposal_id: int) -> None:
             for fut in as_completed(futures):
                 section = futures[fut]
                 try:
-                    fut.result()
+                    drafted = fut.result()
+                    if not drafted:
+                        n_section_busy += 1
+                        log.info(
+                            "cost_writer: skipped section %s (pk=%d); "
+                            "another worker owns it",
+                            section["section_id"],
+                            section["pk"],
+                        )
+                        continue
                     n_done += 1
                     _set_stage(
                         proposal_id,
@@ -447,12 +462,14 @@ def run_cost_writer(proposal_id: int) -> None:
                     )
                     n_failed += 1
 
-        if n_failed:
+        if n_failed or n_section_busy:
             _set_stage(
                 proposal_id,
                 f"Cost Volume Writer complete: {n_done}/{n_total} "
-                f"drafted, {n_failed} failed (see logs). Open the "
+                f"drafted, {n_failed} failed, {n_section_busy} skipped "
+                f"because another worker owned the section. Open the "
                 f"Findings tab — failed sections need a re-run.",
+                status="failed",
             )
         else:
             # `proposed_scenario` only exists in the it_services
@@ -497,6 +514,7 @@ def run_cost_writer(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             "Cost Volume Writer failed — check logs.",
+            status="failed",
         )
 
 
@@ -511,43 +529,45 @@ def _draft_one_section(
     outline_snippet: str,
     comp_text_lookup: dict[str, str],
     cached_prefix: str,
-) -> None:
+) -> bool:
     """Draft a single cost-deferred section and persist. Runs in a
     worker thread; raises on agent failure so the orchestrator can
     count failures."""
-    compliance_text = _compliance_text_for_section(
-        section["compliance_items_addressed"],
-        comp_text_lookup,
-    )
+    if not add_active_section(proposal_id, section["pk"]):
+        return False
+    try:
+        compliance_text = _compliance_text_for_section(
+            section["compliance_items_addressed"], comp_text_lookup,
+        )
 
-    # Wipe any prior draft so the new one isn't appended.
-    clear_section_draft(section["pk"])
+        draft = draft_cost_section(
+            proposal_id=proposal_id,
+            section_id=section["section_id"],
+            section_title=section["section_title"],
+            section_order=section["section_order"],
+            section_brief=section["section_brief"],
+            compliance_item_ids=section["compliance_items_addressed"],
+            compliance_text=compliance_text,
+            page_limit=section["page_limit"],
+            word_limit=section["word_limit"],
+            cached_prefix=cached_prefix,
+            rfp_title=rfp_title,
+            rfp_agency=rfp_agency,
+            pop_months=pop_months,
+            contract_type_signal=contract_type_signal,
+            outline_snippet=outline_snippet,
+        )
 
-    draft = draft_cost_section(
-        proposal_id=proposal_id,
-        section_id=section["section_id"],
-        section_title=section["section_title"],
-        section_order=section["section_order"],
-        section_brief=section["section_brief"],
-        compliance_item_ids=section["compliance_items_addressed"],
-        compliance_text=compliance_text,
-        page_limit=section["page_limit"],
-        word_limit=section["word_limit"],
-        cached_prefix=cached_prefix,
-        rfp_title=rfp_title,
-        rfp_agency=rfp_agency,
-        pop_months=pop_months,
-        contract_type_signal=contract_type_signal,
-        outline_snippet=outline_snippet,
-    )
-
-    persist_section_draft(
-        proposal_section_pk=section["pk"],
-        draft_text_markdown=draft.draft_text_markdown,
-        citations=draft.citations,
-        needs_human_placeholders=draft.needs_human_placeholders,
-        shortfall_mitigations_applied=draft.shortfall_mitigations_applied,
-    )
+        persist_section_draft(
+            proposal_section_pk=section["pk"],
+            draft_text_markdown=draft.draft_text_markdown,
+            citations=draft.citations,
+            needs_human_placeholders=draft.needs_human_placeholders,
+            shortfall_mitigations_applied=draft.shortfall_mitigations_applied,
+        )
+        return True
+    finally:
+        remove_active_section(proposal_id, section["pk"])
 
 
 def spawn_cost_writer(proposal_id: int) -> threading.Thread:

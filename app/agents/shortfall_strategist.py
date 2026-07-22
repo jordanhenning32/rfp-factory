@@ -70,8 +70,8 @@ _TOOL: dict = {
                             "description": (
                                 "For met/partial verdicts: short references to the "
                                 "specific profile field or KB doc that supports the verdict "
-                                "(e.g., 'company_profile.certifications', 'KB DOC #4 — Andy "
-                                "Parr resume')."
+                                "(e.g., 'company_profile.certifications', 'KB DOC #4 — "
+                                "project manager resume')."
                             ),
                         },
                         "gap_severity": {
@@ -110,7 +110,7 @@ _TOOL: dict = {
                                         "description": (
                                             "Strict label — pick one of the enum "
                                             "values. Do NOT append a partner name "
-                                            "(e.g. 'teaming with Nava PBC' is "
+                                            "(e.g. 'teaming with Example Partner' is "
                                             "WRONG — use 'teaming' and put the "
                                             "partner name in partner_suggestions). "
                                             "self-perform = Quadratic does it itself; "
@@ -148,7 +148,7 @@ _TOOL: dict = {
                                         "type": ["string", "null"],
                                         "description": (
                                             "Action required outside the proposal "
-                                            "(e.g., 'Confirm teaming with Nava PBC', "
+                                            "(e.g., 'Confirm teaming with Example Partner', "
                                             "'Pursue ISO 27001'). For teaming, MUST be "
                                             "flagged with [NEEDS_HUMAN]."
                                         ),
@@ -384,7 +384,7 @@ Quadratic's company profile and knowledge base are provided as static context (c
 
 VERDICT RULES:
 - "met" — the profile/KB provides clear, citable evidence that Quadratic satisfies this requirement.
-- "partial" — Quadratic has analogous capability, but not exactly what's specified. Example: RFP requires 5 years of state-level Medicaid experience; Quadratic has CMS federal Medicaid experience via Nava PBC.
+- "partial" — Quadratic has analogous capability, but not exactly what's specified. Example: an RFP requires five years of state health-program experience while the profile supports analogous federal health work.
 - "gap" — Quadratic does not meet this requirement and cannot honestly claim equivalent capability.
 
 GAP SEVERITY / CATEGORY (for partial/gap) — these are flat buckets; pick ONE per item:
@@ -453,7 +453,7 @@ HONESTY CONSTRAINTS — non-negotiable:
 
    APPROACH FIELD VALUES — strict. When you emit the `approach` field on each mitigation_option, use ONE of these exact lowercase hyphenated tokens (the schema enforces this):
      self-perform | teaming | equivalent-experience | in-progress | custom-build | acknowledge-and-risk-frame | no-bid
-   Do NOT compose strings like "teaming with Nava PBC" — for teaming, set approach="teaming" and put the partner names inside partner_suggestions[]. Same for any other approach: the type is in `approach`; the specifics are in the surrounding fields.
+   Do NOT compose strings like "teaming with Example Partner" — for teaming, set approach="teaming" and put the partner names inside partner_suggestions[]. Same for any other approach: the type is in `approach`; the specifics are in the surrounding fields.
 
 PAST DECISIONS LEDGER:
 The PAST DECISIONS LEDGER block in the cached prefix is Quadratic's accumulated memory of how prior gaps were resolved. For each compliance item:
@@ -466,7 +466,7 @@ CITATION RULES (per design doc §7.1):
 - Past performance citations may only reference KB docs of class past_performance_won or past_performance_subbed, OR entries in the profile's past_performance array. NEVER cite a prior_proposal_* doc as completed work — those are voice-grounding only.
 - The KB context provided to you EXCLUDES non-citable classes (prior_proposal_*, agency_context, procurement_craft, boilerplate). Anything you can see is fair game to cite.
 
-QUADRATIC SCALE — small business with ~12 named key personnel. Do NOT invent staff, scale, "hundreds of cleared engineers", or capabilities that aren't in the profile/KB. Authentic small-business framing wins more than inauthentic scale claims.
+QUADRATIC SCALE — use only the staff and scale stated in the active profile. Do NOT invent personnel, "hundreds of cleared engineers", or capabilities that aren't in the profile/KB. Authentic small-business framing wins more than inauthentic scale claims.
 
 QUADRATIC'S POSITIONING — RAPID CUSTOM DEVELOPMENT IS A COMPETITIVE EDGE:
 Many RFPs default to COTS (Commercial Off-The-Shelf) language because the writers haven't caught up to how fast modern custom development has become. With AI-assisted dev cycles (Claude/Copilot/Cursor) plus modern frameworks, small firms like Quadratic can deliver tailored solutions on timelines that previously required buying a product. This is one of Quadratic's competitive differentiators.

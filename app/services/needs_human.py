@@ -43,6 +43,8 @@ import re
 
 from app.db.session import session_scope
 from app.models import ProposalSection
+from app.services.cancellation import section_write_lease
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -136,10 +138,20 @@ def reconcile_placeholders(proposal_section_pk: int) -> bool:
 
     Idempotent. Returns True if anything changed.
     """
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return False
+        return _reconcile_placeholders_owned(proposal_section_pk)
+
+
+def _reconcile_placeholders_owned(proposal_section_pk: int) -> bool:
     with session_scope() as db:
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None or not sec.draft_text_markdown:
             return False
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="reconcile draft placeholders",
+        )
 
         # Heal field-name shape before any of the directional passes
         # so downstream logic (still_inline check, marker comparison,
@@ -219,12 +231,35 @@ def resolve_placeholder(
 ) -> bool:
     """Mark one placeholder resolved and rewrite the draft markdown.
 
+    A successful resolution is a user-visible draft edit, so it increments
+    ``current_revision_number`` exactly once. Idempotent retries of an
+    already-resolved marker remain no-op successes and do not create a
+    second revision.
+
     Returns True if the placeholder was found and updated, OR if a matching
     placeholder is already resolved (idempotent — the user's intent is
     already satisfied, so the action is a no-op success rather than an
     error). Returns False only when no matching placeholder exists at all,
     which signals a real mismatch worth reporting.
     """
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return False
+        return _resolve_placeholder_owned(
+            proposal_section_pk=proposal_section_pk,
+            marker_text=marker_text,
+            kind=kind,
+            value=value,
+        )
+
+
+def _resolve_placeholder_owned(
+    *,
+    proposal_section_pk: int,
+    marker_text: str,
+    kind: str,
+    value: str,
+) -> bool:
     if kind not in ("edit", "signature", "reject"):
         log.warning("resolve_placeholder: unknown kind %r", kind)
         return False
@@ -233,6 +268,9 @@ def resolve_placeholder(
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None or not sec.draft_text_markdown:
             return False
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="resolve draft placeholder",
+        )
 
         placeholders = list(sec.needs_human_placeholders_json or [])
         match_idx: int | None = None
@@ -284,12 +322,12 @@ def resolve_placeholder(
         # an empty parenthetical, leave it — the user can edit later. Aggressive
         # cleanup risks munging legitimate text.
         sec.draft_text_markdown = new_md
+        sec.current_revision_number = (sec.current_revision_number or 0) + 1
         log.info(
-            "resolved placeholder on section pk=%d: kind=%s len=%d marker=%r",
-            proposal_section_pk,
-            kind,
-            len(value),
-            marker_text[:60],
+            "resolved placeholder on section pk=%d: kind=%s len=%d "
+            "rev=%d marker=%r",
+            proposal_section_pk, kind, len(value),
+            sec.current_revision_number, marker_text[:60],
         )
 
     # Run reconcile in a follow-up transaction (the section is committed
@@ -329,16 +367,14 @@ _DATE_PATTERNS: tuple[str, ...] = (
     "proposal date",
     "proposal submission date",
 )
-_SIGNATURE_FALLBACK_NAME = "Andy Parr"
+def _get_signing_authority_name() -> str | None:
+    """Return the signing authority only when the active profile names one.
 
-
-def _get_signing_authority_name() -> str:
-    """Canonical signature for Quadratic proposals — the CEO. Reads
+    Reads
     from company_profile.key_personnel where role contains 'CEO'
-    (case-insensitive), falling back to a hardcoded constant when
-    the profile lookup fails. The user's standing instruction is
-    that the CEO signs every proposal before submission, so we can
-    safely auto-fill any signature placeholder with this name."""
+    (case-insensitive). A missing profile or unnamed authority remains a human
+    task; guessing a person's name in submission-ready prose is unsafe.
+    """
     try:
         from app.core.company_profile import get_company_profile
 
@@ -350,8 +386,8 @@ def _get_signing_authority_name() -> str:
                 if name:
                     return name
     except Exception:
-        log.exception("_get_signing_authority_name: profile lookup failed; falling back to constant")
-    return _SIGNATURE_FALLBACK_NAME
+        log.warning("_get_signing_authority_name: profile lookup failed")
+    return None
 
 
 def auto_resolve_obvious_placeholders(proposal_section_pk: int) -> int:
@@ -359,9 +395,8 @@ def auto_resolve_obvious_placeholders(proposal_section_pk: int) -> int:
     defaults so the user isn't asked for the obvious stuff.
 
     Two rules currently apply:
-      1. category=='signature'  → kind='signature', value=<CEO name>
-         (the CEO signs every proposal, per Jordan's standing
-         instruction; lookup via _get_signing_authority_name).
+      1. category=='signature'  → kind='signature', value=<profile CEO name>
+         only when the active profile explicitly names that authority.
       2. marker_text matches a doc-date pattern (submission /
          transmittal / cover letter date / "today") → kind='edit',
          value=today formatted as 'Month D, YYYY' (e.g.
@@ -374,6 +409,15 @@ def auto_resolve_obvious_placeholders(proposal_section_pk: int) -> int:
     placeholders surface on the Needs Human Input tab.
 
     Returns the count of placeholders resolved by this pass."""
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return 0
+        return _auto_resolve_obvious_placeholders_owned(proposal_section_pk)
+
+
+def _auto_resolve_obvious_placeholders_owned(
+    proposal_section_pk: int,
+) -> int:
     from datetime import date as _date
 
     today_str = _date.today().strftime("%B %d, %Y")
@@ -387,6 +431,9 @@ def auto_resolve_obvious_placeholders(proposal_section_pk: int) -> int:
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None:
             return 0
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="auto-resolve draft placeholders",
+        )
         placeholders = list(sec.needs_human_placeholders_json or [])
 
     actions: list[tuple[str, str, str]] = []
@@ -398,7 +445,7 @@ def auto_resolve_obvious_placeholders(proposal_section_pk: int) -> int:
             continue
         category = (ph.get("category") or "").lower()
 
-        if category == "signature":
+        if category == "signature" and signing_name:
             actions.append((marker_text, "signature", signing_name))
             continue
 
@@ -451,10 +498,20 @@ def auto_resolve_via_llm(proposal_section_pk: int) -> int:
     swallow — the user still has the placeholders surfaced and
     can resolve manually).
     """
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return 0
+        return _auto_resolve_via_llm_owned(proposal_section_pk)
+
+
+def _auto_resolve_via_llm_owned(proposal_section_pk: int) -> int:
     with session_scope() as db:
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None:
             return 0
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="auto-resolve draft placeholders",
+        )
         proposal_id = sec.proposal_id
         section_id = sec.section_id or ""
         section_title = sec.section_title or ""
@@ -621,6 +678,19 @@ def carry_forward_resolved_placeholders(
 
     Returns the count of priors carried forward.
     """
+    with section_write_lease(proposal_section_pk) as acquired:
+        if not acquired:
+            return 0
+        return _carry_forward_resolved_placeholders_owned(
+            proposal_section_pk,
+            prior_resolved,
+        )
+
+
+def _carry_forward_resolved_placeholders_owned(
+    proposal_section_pk: int,
+    prior_resolved: list[dict],
+) -> int:
     if not prior_resolved:
         return 0
     actionable = [
@@ -638,6 +708,9 @@ def carry_forward_resolved_placeholders(
         sec = db.get(ProposalSection, proposal_section_pk)
         if sec is None or not sec.draft_text_markdown:
             return 0
+        ensure_proposal_mutable(
+            db, sec.proposal_id, operation="carry forward draft placeholders",
+        )
         new_placeholders = list(sec.needs_human_placeholders_json or [])
         if not new_placeholders:
             return 0

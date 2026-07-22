@@ -36,6 +36,7 @@ from app.core.enums import ProposalOutcomeStatus
 # session_scope() call needs redirection across test boundaries.
 from app.db import session as _db_session
 from app.models import Proposal, ProposalOutcome
+from app.services.proposal_access import ensure_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +104,9 @@ def upsert_outcome(
     outcome_value = _coerce_outcome_value(outcome)
 
     with _db_session.session_scope() as db:
+        ensure_proposal_mutable(
+            db, proposal_id, operation="edit proposal outcome",
+        )
         row = db.execute(
             select(ProposalOutcome).where(ProposalOutcome.proposal_id == proposal_id)
         ).scalar_one_or_none()

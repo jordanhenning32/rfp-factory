@@ -37,6 +37,7 @@ from app.services.cost_reviewer import (
     get_cost_review_findings_snapshot,
     get_cost_review_strategy,
 )
+from app.services.proposal_access import require_proposal_mutable
 from app.services.stages import record_stage as _set_stage
 
 log = logging.getLogger(__name__)
@@ -260,6 +261,9 @@ def synthesize_strategy_directives(
     Returns None when prerequisites are missing (no cached strategy,
     no eligible sections). Caller surfaces the reason via UI.
     """
+    require_proposal_mutable(
+        proposal_id, operation="synthesize cost review strategy",
+    )
     cached = get_cost_review_strategy(proposal_id)
     if not cached or not cached.get("markdown"):
         log.info(
@@ -358,11 +362,16 @@ def _apply_one_directive(
     state captures it independently for the per-section icon."""
     _update_section_progress(proposal_id, section_id, "running")
     try:
-        run_writer_for_section(
+        regenerated = run_writer_for_section(
             proposal_id=proposal_id,
             proposal_section_pk=section_pk,
             user_directive=directive,
         )
+        if not regenerated:
+            raise RuntimeError(
+                f"Writer regeneration failed for section {section_id} "
+                f"(pk={section_pk})"
+            )
         _update_section_progress(proposal_id, section_id, "done")
     except Exception:
         _update_section_progress(proposal_id, section_id, "failed")
@@ -387,6 +396,9 @@ def apply_strategy_directives(
     mid-run; each writer logs its own AgentRun so the audit trail
     survives.
     """
+    require_proposal_mutable(
+        proposal_id, operation="apply cost review strategy",
+    )
     if not directives:
         return 0
     settings = get_settings()
@@ -500,6 +512,7 @@ def apply_strategy_directives(
             + (f" ({n_failed} failed — see logs)" if n_failed else "")
             + ". Open the Draft tab to review the regenerated "
             "sections.",
+            status="failed" if n_failed else "completed",
         )
         # Mark complete — UI poll picks this up and fires the
         # sticky completion toast on whatever tab the user is on

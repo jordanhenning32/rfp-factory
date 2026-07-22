@@ -59,6 +59,11 @@ from app.services.cost_reviewer import (
 )
 from app.services.market_scan import get_market_scan_snapshot
 from app.services.pricing import get_pricing_packages_snapshot
+from app.services.proposal_access import require_proposal_mutable
+from app.services.review_freshness import (
+    capture_it_cost_review_basis,
+    record_cost_review_coverage,
+)
 from app.services.stages import record_stage as _set_stage
 
 log = logging.getLogger(__name__)
@@ -476,12 +481,14 @@ def run_cost_reviewer(proposal_id: int) -> None:
     """Sync entry point. Snapshots inputs, runs the dual reviewer +
     consolidator pipeline, persists the final findings. Catches all
     exceptions and surfaces via stage banner."""
+    require_proposal_mutable(proposal_id, operation="run cost review")
     log.info("cost reviewer starting for proposal %d", proposal_id)
     try:
         _set_stage(
             proposal_id,
             "Cost Reviewer: snapshotting cost build + scope + market scan…",
         )
+        basis_before = capture_it_cost_review_basis(proposal_id)
         inputs = _snapshot_cost_reviewer_inputs(proposal_id)
         if inputs is None:
             _set_stage(
@@ -489,6 +496,23 @@ def run_cost_reviewer(proposal_id: int) -> None:
                 f"Cost Reviewer: prerequisites missing for proposal "
                 f"{proposal_id}. Run Cost Analyst first; the reviewer "
                 f"needs the persisted cost build to fact-check.",
+                status="failed",
+            )
+            return
+
+        reviewed_basis = capture_it_cost_review_basis(proposal_id)
+        if (
+            basis_before is None
+            or reviewed_basis is None
+            or basis_before != reviewed_basis
+            or reviewed_basis["scenario"] != inputs.proposed_scenario
+        ):
+            _set_stage(
+                proposal_id,
+                "Cost Reviewer: pricing changed while inputs were being "
+                "snapshotted. No review evidence was saved; rerun Cost "
+                "Reviewer.",
+                status="failed",
             )
             return
 
@@ -498,6 +522,16 @@ def run_cost_reviewer(proposal_id: int) -> None:
             on_stage=lambda msg: _set_stage(proposal_id, msg),
         )
         result = outcome.final
+
+        if capture_it_cost_review_basis(proposal_id) != reviewed_basis:
+            _set_stage(
+                proposal_id,
+                "Cost Reviewer: pricing changed while the review was "
+                "running. The stale result was discarded; rerun Cost "
+                "Reviewer.",
+                status="failed",
+            )
+            return
 
         n_rows = upsert_cost_review_findings(
             proposal_id=proposal_id,
@@ -510,6 +544,22 @@ def run_cost_reviewer(proposal_id: int) -> None:
         # judgment. Auto-accepted rows render with an "AUTO" chip
         # so the user can spot what to scrutinize.
         n_auto_accepted = auto_accept_consensus_findings(proposal_id)
+        # Bind readiness evidence to the scenario this persisted result
+        # actually reviewed. Pricing mutations invalidate older coverage.
+        coverage_saved = record_cost_review_coverage(
+            proposal_id,
+            inputs.proposed_scenario,
+            expected_basis=reviewed_basis,
+        )
+        if not coverage_saved:
+            _set_stage(
+                proposal_id,
+                "Cost Reviewer: pricing changed before review evidence "
+                "could be committed. Submission remains blocked; rerun "
+                "Cost Reviewer.",
+                status="failed",
+            )
+            return
 
         # Stage banner — surface count + severity breakdown so user
         # knows what to look at on the Cost tab.
@@ -554,6 +604,7 @@ def run_cost_reviewer(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             "Cost Reviewer failed — check logs.",
+            status="failed",
         )
 
 

@@ -28,6 +28,8 @@ from app.models import (
     Proposal,
     ProposalSection,
 )
+from app.services.period_of_performance import get_pop_months_for_proposal
+from app.services.proposal_access import require_proposal_mutable
 
 log = logging.getLogger(__name__)
 
@@ -224,6 +226,9 @@ def propose_team_composition(
         }
 
     Returns None when the proposal doesn't exist."""
+    require_proposal_mutable(
+        proposal_id, operation="propose team composition",
+    )
     with session_scope() as db:
         prop = db.get(Proposal, proposal_id)
         if prop is None:
@@ -231,7 +236,7 @@ def propose_team_composition(
         rfp_title = (prop.title or "").strip()
         rfp_agency = (prop.agency or "").strip()
 
-    pop_months = 12  # same default as elsewhere
+    pop_months = get_pop_months_for_proposal(proposal_id)
     compliance_block = _format_compliance_block(proposal_id)
     outline_block = _format_outline_block(proposal_id)
     labor_catalog_block = _format_labor_catalog_block()

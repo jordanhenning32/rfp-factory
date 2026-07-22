@@ -14,7 +14,7 @@ description = "RFP Response System for Quadratic Digital LLC — multi-agent pro
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
-    "nicegui>=2.0",
+    "nicegui>=3.11",
     "uvicorn[standard]>=0.30",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
@@ -69,6 +69,13 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
 ]
+# Real-browser end-to-end tests. Kept separate from ``dev`` because the
+# Playwright browser runtime is comparatively large and is not needed for
+# unit/service-layer development.
+e2e = [
+    "pytest>=8.3",
+    "playwright==1.60.0",
+]
 
 [tool.ruff]
 line-length = 110
@@ -81,3 +88,6 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "e2e: isolated real-browser end-to-end tests (enable with --e2e)",
+]

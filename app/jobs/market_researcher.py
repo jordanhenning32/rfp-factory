@@ -40,6 +40,7 @@ from app.models import (
     RfpPackageDocument,
 )
 from app.services.market_scan import upsert_market_scan
+from app.services.proposal_access import require_proposal_mutable
 from app.services.stages import record_stage as _set_stage
 
 log = logging.getLogger(__name__)
@@ -103,10 +104,9 @@ def _snapshot_market_research_inputs(
                 t = (text or "").strip()
                 if not t:
                     continue
-                if scope_total + len(t) + 2 > 2500:
-                    break
-                scope_chunks.append(t)
-                scope_total += len(t) + 2
+                if scope_total + len(t) + 2 <= 2500:
+                    scope_chunks.append(t)
+                    scope_total += len(t) + 2
         scope_summary = "\n\n".join(scope_chunks)
 
         # Pull the main solicitation's preamble as a fallback when
@@ -173,6 +173,9 @@ def _build_quadratic_summary() -> str:
 def run_market_research(proposal_id: int) -> None:
     """Sync entry point. Builds inputs, runs the agent, persists the
     result. Catches all exceptions and surfaces via stage banner."""
+    require_proposal_mutable(
+        proposal_id, operation="run cost market research",
+    )
     log.info("market researcher starting for proposal %d", proposal_id)
     try:
         _set_stage(
@@ -184,6 +187,7 @@ def run_market_research(proposal_id: int) -> None:
             _set_stage(
                 proposal_id,
                 f"Market research: proposal {proposal_id} not found.",
+                status="failed",
             )
             return
 
@@ -254,6 +258,7 @@ def run_market_research(proposal_id: int) -> None:
             proposal_id=proposal_id,
             pass_a=pass_a,
             pass_b=pass_b,
+            target_pop_months=inputs.pop_months,
         )
 
         # Persist. agent_run_id linkage would require threading the
@@ -295,6 +300,7 @@ def run_market_research(proposal_id: int) -> None:
         _set_stage(
             proposal_id,
             "Market research failed — check logs.",
+            status="failed",
         )
 
 

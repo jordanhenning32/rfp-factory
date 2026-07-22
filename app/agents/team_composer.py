@@ -176,7 +176,7 @@ DISCIPLINE:
 
 OUTPUT:
 - 4-8 roles typically. More than 10 on a sub-$2M bid is over-built; refactor.
-- Use ROLE NAMES, not personal names. "Project Manager", not "Andy Parr".
+- Use ROLE NAMES, not personal names. "Project Manager", not "Alex Rivera".
 - Set time_allocation_pct realistically for a 12-month PoP:
     * Project Manager (full lifecycle): 40-60%
     * Solution Architect / Tech Lead (peaks early, tapers): 30-50%

@@ -21,6 +21,10 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from app.services.proposal_access import proposal_write_lock
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +80,10 @@ def request_cancel(job_kind: str, proposal_id: int) -> bool:
     with _lock:
         event = _events.get(key)
         keys = list(_events.keys())
+        if event is not None:
+            # Set while still holding the registry lock so unregister/new
+            # register cannot slip between lookup and signal delivery.
+            event.set()
     if event is None:
         # Diagnostic — enumerate live threads so we can see if a job is
         # actually running despite the missing registry entry.
@@ -106,7 +114,6 @@ def request_cancel(job_kind: str, proposal_id: int) -> bool:
             thread_names,
         )
         return False
-    event.set()
     log.info(
         "cancellation: request_cancel %s/%d delivered (registry: %r)",
         job_kind,
@@ -132,59 +139,168 @@ def is_running(job_kind: str, proposal_id: int) -> bool:
     return event is not None and not event.is_set()
 
 
-def unregister(job_kind: str, proposal_id: int) -> None:
-    """Job calls this from its finally block to clean up the registry."""
+def unregister(
+    job_kind: str,
+    proposal_id: int,
+    event: threading.Event | None = None,
+) -> bool:
+    """Remove a job's cancel event and return whether it was removed.
+
+    Jobs should pass the event returned by :func:`register`. That ownership
+    check prevents a delayed/stale cleanup from deleting a newer job that has
+    since registered under the same key. ``event=None`` remains available for
+    administrative cleanup and backwards-compatible callers.
+    """
     key = (job_kind, proposal_id)
     with _lock:
-        existed = _events.pop(key, None) is not None
+        current = _events.get(key)
+        owned = current is not None and (event is None or current is event)
+        if owned:
+            _events.pop(key, None)
         keys = list(_events.keys())
     log.info(
-        "cancellation: unregister %s/%d (existed=%s, registry now: %r)",
-        job_kind,
-        proposal_id,
-        existed,
-        keys,
+        "cancellation: unregister %s/%d (removed=%s, registry now: %r)",
+        job_kind, proposal_id, owned, keys,
     )
+    return owned
 
 
 # Job-kind constants so callers don't have to remember magic strings.
 JOB_AUTO_REVIEW = "auto_review_revise"
 
 
-# ---- Active-section tracking --------------------------------------------
-# Lets the UI know which sections a long-running per-section loop is
-# CURRENTLY processing, so we can mark them "in flight" and discourage
-# concurrent user actions (manual regenerate, finding-apply) on them.
-# Other sections — already past or not yet reached — are safe to act on.
-#
-# Set-valued (per proposal_id) so a parallelized auto-loop with N workers
-# can mark all N in-flight sections at once. The serial loop just adds
-# and removes one at a time.
-
-_active_sections: dict[int, set[int]] = {}
+# ---- Active-section ownership -------------------------------------------
+# This registry is both the UI's "in flight" signal and the write exclusion
+# primitive for section-level jobs. A visibility-only refcount is unsafe: two
+# workers can both snapshot a draft, call a provider, and then persist in
+# completion order (last writer wins). Each section is therefore owned by
+# exactly one thread at a time. Acquisition by that same thread is re-entrant
+# because the auto-review worker deliberately nests Writer regeneration while
+# retaining ownership of the section.
 
 
-def add_active_section(proposal_id: int, section_pk: int) -> None:
-    """Worker calls this when it picks up a section to process."""
-    with _lock:
-        _active_sections.setdefault(proposal_id, set()).add(section_pk)
+class _SectionOwnership:
+    __slots__ = ("owner", "depth")
+
+    def __init__(self, owner: threading.Thread) -> None:
+        self.owner = owner
+        self.depth = 1
 
 
-def remove_active_section(proposal_id: int, section_pk: int) -> None:
-    """Worker calls this when it finishes (or aborts) a section. Cleans
-    up the proposal entry entirely once the set drains."""
+_active_sections: dict[int, dict[int, _SectionOwnership]] = {}
+
+
+class SectionOwnershipError(RuntimeError):
+    """Raised when a section write bypasses its required ownership lease."""
+
+
+def add_active_section(proposal_id: int, section_pk: int) -> bool:
+    """Try to acquire exclusive ownership of one proposal section.
+
+    Returns ``True`` when ownership was acquired. Re-entry by the same thread
+    increments a depth counter and also returns ``True``. A different thread
+    receives ``False`` and must skip/fail closed without writing the section.
+    """
+    owner = threading.current_thread()
+    # Coordinate acquisition with approval/submission's readiness snapshot.
+    # If this wins first, readiness sees the active section and blocks. If the
+    # lifecycle transition wins first, this work linearizes after it.
+    with proposal_write_lock(proposal_id):
+        with _lock:
+            active = _active_sections.setdefault(proposal_id, {})
+            current = active.get(section_pk)
+            if current is None:
+                active[section_pk] = _SectionOwnership(owner)
+                return True
+            if current.owner is owner:
+                current.depth += 1
+                return True
+
+            log.info(
+                "section ownership: refusing proposal=%d section=%d to %s; "
+                "already owned by %s",
+                proposal_id,
+                section_pk,
+                owner.name,
+                current.owner.name,
+            )
+            return False
+
+
+def remove_active_section(proposal_id: int, section_pk: int) -> bool:
+    """Release one re-entrant ownership level held by the current thread.
+
+    A non-owner cannot clear another worker's marker. Returning a bool makes
+    stale cleanup observable while preserving callers that ignore the result.
+    """
+    owner = threading.current_thread()
     with _lock:
         active = _active_sections.get(proposal_id)
         if active is None:
-            return
-        active.discard(section_pk)
+            return False
+        current = active.get(section_pk)
+        if current is None or current.owner is not owner:
+            return False
+        if current.depth > 1:
+            current.depth -= 1
+        else:
+            active.pop(section_pk, None)
         if not active:
             _active_sections.pop(proposal_id, None)
+        return True
+
+
+def owns_active_section(proposal_id: int, section_pk: int) -> bool:
+    """Return whether the current thread owns this section's write lease."""
+    owner = threading.current_thread()
+    with _lock:
+        current = (_active_sections.get(proposal_id) or {}).get(section_pk)
+        return current is not None and current.owner is owner
+
+
+def require_active_section_owner(proposal_id: int, section_pk: int) -> None:
+    """Fail closed when a low-level draft persist bypasses orchestration."""
+    if not owns_active_section(proposal_id, section_pk):
+        raise SectionOwnershipError(
+            f"Section {section_pk} on proposal {proposal_id} cannot be "
+            "written without an active ownership lease."
+        )
+
+
+@contextmanager
+def section_write_lease(section_pk: int) -> Iterator[bool]:
+    """Resolve a section's proposal and acquire its re-entrant write lease.
+
+    The session module is resolved at call time so isolated test harnesses and
+    alternate data roots remain authoritative. ``False`` means not found or
+    already owned by a different thread; callers must not mutate in either
+    case.
+    """
+    from app.db import session as db_session
+    from app.models import ProposalSection
+
+    with db_session.session_scope() as db:
+        section = db.get(ProposalSection, section_pk)
+        proposal_id = section.proposal_id if section is not None else None
+    if proposal_id is None:
+        yield False
+        return
+
+    acquired = add_active_section(int(proposal_id), section_pk)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            remove_active_section(int(proposal_id), section_pk)
 
 
 def clear_active_sections(proposal_id: int) -> None:
-    """End-of-loop cleanup. Drops every in-flight marker for this proposal
-    so a delayed worker exit can't leave stale entries in the registry."""
+    """Administrative/test cleanup for every marker on one proposal.
+
+    Normal workers must pair ``add_active_section`` with
+    ``remove_active_section`` instead. Call this only when no real worker for
+    the proposal can still be active.
+    """
     with _lock:
         _active_sections.pop(proposal_id, None)
 
@@ -195,4 +311,4 @@ def get_active_sections(proposal_id: int) -> set[int]:
     returns a copy so callers can iterate without holding the lock."""
     with _lock:
         active = _active_sections.get(proposal_id)
-        return set(active) if active else set()
+        return set(active.keys()) if active else set()

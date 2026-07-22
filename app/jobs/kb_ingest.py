@@ -39,16 +39,22 @@ def ingest_kb_document(document_id: int) -> None:
         document_class = doc.document_class
     try:
         text, _ = extract_text_for_path(path)
+        if not (text or "").strip():
+            raise ValueError("document contains no extractable text")
     except Exception:
         log.exception("kb ingestion: text extraction failed for doc %d", document_id)
-        text = ""
+        with session_scope() as db:
+            doc = db.get(KnowledgeBaseDocument, document_id)
+            if doc is not None:
+                doc.extracted_text_md = None
+                doc.status = KbDocumentStatus.DEACTIVATED
+        return
 
     with session_scope() as db:
         doc = db.get(KnowledgeBaseDocument, document_id)
         if doc is None:
             return
-        doc.extracted_text_md = text or None
-        # Even with empty text, mark active — user can add tags/notes manually.
+        doc.extracted_text_md = text
         doc.status = KbDocumentStatus.ACTIVE
 
     log.info("kb ingestion: document %d text=%d chars", document_id, len(text or ""))

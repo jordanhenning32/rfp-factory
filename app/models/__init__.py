@@ -8,6 +8,7 @@ from app.models.agent_run import AgentRun
 from app.models.amendment import AmendmentRun
 from app.models.company_profile import CompanyProfileVersion, InternalPricingRules
 from app.models.compliance import ComplianceMatrixItem, GapAnalysis
+from app.models.cost_matrix import CostMatrixArtifact, CostMatrixOutput
 from app.models.kb import KnowledgeBaseChunk, KnowledgeBaseDocument
 from app.models.learned_rule import LearnedRule
 from app.models.market_scan import (
@@ -35,6 +36,8 @@ __all__ = [
     "ComplianceMatrixItem",
     "CompanyProfileVersion",
     "CostReviewFinding",
+    "CostMatrixArtifact",
+    "CostMatrixOutput",
     "GapAnalysis",
     "InternalPricingRules",
     "KnowledgeBaseChunk",
